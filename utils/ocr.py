@@ -4,341 +4,361 @@ from PIL import Image
 import pdf2image
 import os
 import logging
-from typing import List, Dict, Tuple, Any, Optional
-import time
+from typing import List, Dict, Tuple, Any, Optional, Union
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import multiprocessing as mp
 
-# Try to import pytesseract
 try:
     import pytesseract
     TESSERACT_AVAILABLE = True
 except ImportError:
     TESSERACT_AVAILABLE = False
-    print("Warning: pytesseract not installed. Please run: pip install pytesseract")
+    logging.warning("pytesseract not installed. Run: pip install pytesseract")
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-class TesseractOCRProcessor:
-    """
-    OCR processor using Tesseract (works offline, no downloads needed)
-    """
+
+class EfficientTesseractOCR:
+    """Optimized OCR processor with caching, parallel processing, and memory efficiency"""
     
-    def __init__(self, languages: List[str] = ['eng', 'hin', 'guj']):
+    _instance = None
+    _initialized = False
+    
+    def __new__(cls, *args, **kwargs):
+        """Singleton pattern for resource efficiency"""
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def __init__(self, languages: List[str] = None, num_workers: int = None):
         """
-        Initialize Tesseract OCR
-        
         Args:
-            languages: List of language codes ['eng', 'hin', 'guj']
+            languages: Language codes (default: ['eng', 'hin', 'guj'])
+            num_workers: Number of parallel workers (default: CPU count)
         """
-        self.languages = languages
+        if self._initialized:
+            return
+            
+        self.languages = languages or ['eng', 'hin', 'guj']
+        self.lang_string = '+'.join(self.languages)
+        self.num_workers = num_workers or min(4, mp.cpu_count())
         
         if not TESSERACT_AVAILABLE:
-            logger.error("pytesseract not installed. Please install: pip install pytesseract")
+            logger.error("pytesseract not installed")
             return
         
-        # Set Tesseract path for Windows
-        tesseract_paths = [
+        self._setup_tesseract()
+        self._initialized = True
+    
+    def _setup_tesseract(self) -> bool:
+        """Setup Tesseract executable path"""
+        paths = [
             r'C:\Program Files\Tesseract-OCR\tesseract.exe',
-            r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe'
+            r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+            '/usr/bin/tesseract',
+            '/usr/local/bin/tesseract'
         ]
         
-        found = False
-        for path in tesseract_paths:
+        for path in paths:
             if os.path.exists(path):
                 pytesseract.pytesseract.tesseract_cmd = path
-                logger.info(f"✓ Tesseract found at: {path}")
-                found = True
-                break
+                logger.info(f"✓ Tesseract: {path}")
+                return True
         
-        if not found:
-            logger.warning("Tesseract not found at standard locations.")
-            logger.warning("Please install from: https://github.com/UB-Mannheim/tesseract/wiki")
-            logger.warning("Or set path manually in code.")
-            
-            # Try to find in PATH
-            try:
-                pytesseract.get_tesseract_version()
-                logger.info("✓ Found Tesseract in PATH")
-                found = True
-            except:
-                logger.error("✗ Tesseract not found anywhere!")
-        
-        if found:
-            logger.info(f"Tesseract initialized with languages: {languages}")
-    
-    def pdf_to_images(self, pdf_path: str, dpi: int = 200) -> List[np.ndarray]:
-        """
-        Convert PDF to list of images
-        """
         try:
-            images = pdf2image.convert_from_path(pdf_path, dpi=dpi)
-            return [np.array(img) for img in images]
-        except Exception as e:
-            logger.error(f"Error converting PDF to images: {e}")
-            return []
+            pytesseract.get_tesseract_version()
+            logger.info("✓ Tesseract found in PATH")
+            return True
+        except:
+            logger.error("✗ Tesseract not found. Install from: https://github.com/UB-Mannheim/tesseract/wiki")
+            return False
     
-    def preprocess_image(self, image: np.ndarray) -> np.ndarray:
+    @staticmethod
+    @lru_cache(maxsize=32)
+    def _get_preprocess_params(image_shape: Tuple[int, int]) -> Dict[str, int]:
+        """Cached preprocessing parameters based on image size"""
+        h, w = image_shape
+        area = h * w
+        
+        if area > 4000000:  # Large images
+            return {'blur_kernel': 5, 'block_size': 15, 'c': 3}
+        elif area > 1000000:  # Medium images
+            return {'blur_kernel': 3, 'block_size': 11, 'c': 2}
+        else:  # Small images
+            return {'blur_kernel': 3, 'block_size': 9, 'c': 2}
+    
+    def preprocess_image(self, image: np.ndarray, enhance: bool = True) -> np.ndarray:
         """
-        Preprocess image for better OCR results
+        Optimized image preprocessing
+        
+        Args:
+            image: Input image
+            enhance: Apply enhancement (slower but better quality)
         """
-        # Convert to grayscale
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        # Convert to grayscale efficiently
+        if image.ndim == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if image.shape[2] == 3 else cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
         else:
             gray = image
         
-        # Apply adaptive thresholding
-        processed = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 11, 2
+        if not enhance:
+            return gray
+        
+        # Get cached parameters
+        params = self._get_preprocess_params(gray.shape)
+        
+        # Denoise first (more efficient)
+        denoised = cv2.medianBlur(gray, params['blur_kernel'])
+        
+        # Adaptive threshold
+        binary = cv2.adaptiveThreshold(
+            denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, params['block_size'], params['c']
         )
         
-        # Denoise
-        processed = cv2.medianBlur(processed, 3)
-        
-        return processed
+        return binary
     
-    def extract_text(self, image: np.ndarray, preprocess: bool = True) -> List[Dict[str, Any]]:
+    def extract_text(self, image: np.ndarray, preprocess: bool = True, 
+                     psm: int = 3, min_confidence: float = 0.0) -> List[Dict[str, Any]]:
         """
-        Extract text from single image
+        Extract text from image with confidence filtering
+        
+        Args:
+            image: Input image
+            preprocess: Apply preprocessing
+            psm: Page segmentation mode (3=auto, 6=single block)
+            min_confidence: Minimum confidence threshold (0-1)
         """
         if not TESSERACT_AVAILABLE:
-            logger.error("pytesseract not available")
             return []
         
         try:
-            start_time = time.time()
+            # Preprocess
+            img = self.preprocess_image(image) if preprocess else image
+            pil_img = Image.fromarray(img)
             
-            # Preprocess if requested
-            if preprocess:
-                image_to_process = self.preprocess_image(image)
-            else:
-                image_to_process = image
-            
-            # Convert to PIL Image for pytesseract
-            pil_image = Image.fromarray(image_to_process)
-            
-            # Extract text with bounding boxes
+            # OCR with optimized config
+            config = f'--psm {psm} --oem 3'  # OEM 3 uses LSTM only (fastest)
             data = pytesseract.image_to_data(
-                pil_image, 
-                lang='+'.join(self.languages),
-                output_type=pytesseract.Output.DICT,
-                config='--psm 3'
+                pil_img, lang=self.lang_string,
+                output_type=pytesseract.Output.DICT, config=config
             )
             
-            # Format results
-            formatted_results = []
-            n_boxes = len(data['level'])
+            # Vectorized filtering for speed
+            conf_array = np.array(data['conf'], dtype=float)
+            valid_mask = conf_array > (min_confidence * 100)
             
-            for i in range(n_boxes):
-                conf = int(data['conf'][i])
-                if conf > 0:  # Only include confident results
-                    text = data['text'][i].strip()
-                    if text:  # Only include non-empty text
-                        formatted_results.append({
-                            'text': text,
-                            'bbox': [
-                                float(data['left'][i]),
-                                float(data['top'][i]),
-                                float(data['left'][i] + data['width'][i]),
-                                float(data['top'][i] + data['height'][i])
-                            ],
-                            'confidence': float(conf) / 100.0,
-                            'language': self._detect_language(text)
-                        })
+            results = []
+            for i in np.where(valid_mask)[0]:
+                text = data['text'][i].strip()
+                if text:
+                    results.append({
+                        'text': text,
+                        'bbox': [
+                            data['left'][i], data['top'][i],
+                            data['left'][i] + data['width'][i],
+                            data['top'][i] + data['height'][i]
+                        ],
+                        'confidence': conf_array[i] / 100.0,
+                        'language': self._detect_language_fast(text)
+                    })
             
-            processing_time = time.time() - start_time
-            logger.info(f"OCR completed in {processing_time:.2f}s, found {len(formatted_results)} text blocks")
-            
-            return formatted_results
+            return results
             
         except Exception as e:
-            logger.error(f"Error in OCR extraction: {e}")
+            logger.error(f"OCR error: {e}")
             return []
     
-    def extract_from_image(self, image_path: str) -> Dict[str, Any]:
-        """
-        Extract text from image file
-        """
-        try:
-            # Read image
-            image = cv2.imread(image_path)
-            if image is None:
-                raise ValueError(f"Cannot read image: {image_path}")
-            
-            # Convert BGR to RGB
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            
-            # Extract text
-            results = self.extract_text(image)
-            total_text = [r['text'] for r in results]
-            avg_confidence = np.mean([r['confidence'] for r in results]) if results else 0
-            
-            # Also get full page text
-            try:
-                full_text = pytesseract.image_to_string(image, lang='+'.join(self.languages))
-            except:
-                full_text = ' '.join(total_text)
-            
-            return {
-                'image_path': image_path,
-                'total_text_blocks': len(results),
-                'text_blocks': results,
-                'full_text': full_text,
-                'avg_confidence': avg_confidence,
-                'languages_detected': list(set(r['language'] for r in results))
-            }
-            
-        except Exception as e:
-            logger.error(f"Error processing image {image_path}: {e}")
-            return {
-                'image_path': image_path,
-                'error': str(e),
-                'text_blocks': [],
-                'full_text': ''
-            }
-    
-    def _detect_language(self, text: str) -> str:
-        """
-        Simple language detection
-        """
+    @staticmethod
+    @lru_cache(maxsize=1000)
+    def _detect_language_fast(text: str) -> str:
+        """Cached language detection using character ranges"""
         if not text:
             return 'unknown'
         
-        # Character ranges
-        devanagari_range = range(0x0900, 0x097F + 1)  # Hindi
-        gujarati_range = range(0x0A80, 0x0AFF + 1)    # Gujarati
-        
-        devanagari_count = sum(1 for char in text if ord(char) in devanagari_range)
-        gujarati_count = sum(1 for char in text if ord(char) in gujarati_range)
-        english_count = sum(1 for char in text if char.isalpha() and char.isascii())
-        
-        total_alpha = devanagari_count + gujarati_count + english_count
-        
-        if total_alpha == 0:
+        # Use sets for O(1) lookup
+        chars = set(ord(c) for c in text if c.isalpha())
+        if not chars:
             return 'unknown'
         
-        if devanagari_count / total_alpha > 0.5:
-            return 'hin'
-        elif gujarati_count / total_alpha > 0.5:
-            return 'guj'
-        elif english_count / total_alpha > 0.5:
-            return 'eng'
-        else:
-            return 'mixed'
-    
-    def get_text_by_region(self, image: np.ndarray, region_bbox: List[float]) -> List[str]:
-        """
-        Extract text from specific region of image
-        """
-        if not TESSERACT_AVAILABLE:
-            return []
+        devanagari = sum(1 for c in chars if 0x0900 <= c <= 0x097F)
+        gujarati = sum(1 for c in chars if 0x0A80 <= c <= 0x0AFF)
+        ascii_alpha = sum(1 for c in chars if c < 128)
         
-        # Crop image to region
-        x1, y1, x2, y2 = map(int, region_bbox)
+        total = len(chars)
+        thresholds = [(devanagari, 'hin'), (gujarati, 'guj'), (ascii_alpha, 'eng')]
+        
+        lang = max(thresholds, key=lambda x: x[0])
+        return lang[1] if lang[0] / total > 0.3 else 'mixed'
+    
+    def extract_from_image(self, image_path: str, return_full_text: bool = True) -> Dict[str, Any]:
+        """Extract text from image file with optional full text"""
+        try:
+            img = cv2.imread(image_path)
+            if img is None:
+                raise ValueError(f"Cannot read: {image_path}")
+            
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            results = self.extract_text(img)
+            
+            output = {
+                'image_path': image_path,
+                'total_blocks': len(results),
+                'text_blocks': results,
+                'avg_confidence': float(np.mean([r['confidence'] for r in results])) if results else 0.0,
+                'languages': list(set(r['language'] for r in results))
+            }
+            
+            if return_full_text:
+                try:
+                    output['full_text'] = pytesseract.image_to_string(img, lang=self.lang_string)
+                except:
+                    output['full_text'] = ' '.join(r['text'] for r in results)
+            
+            return output
+            
+        except Exception as e:
+            logger.error(f"Error: {image_path}: {e}")
+            return {'image_path': image_path, 'error': str(e), 'text_blocks': []}
+    
+    def extract_from_pdf(self, pdf_path: str, dpi: int = 200, 
+                         max_pages: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Extract text from PDF with parallel processing
+        
+        Args:
+            pdf_path: Path to PDF
+            dpi: Resolution for conversion
+            max_pages: Limit number of pages (None = all)
+        """
+        try:
+            # Convert PDF to images
+            images = pdf2image.convert_from_path(
+                pdf_path, dpi=dpi, 
+                last_page=max_pages, 
+                fmt='jpeg',  # JPEG is faster than PNG
+                thread_count=self.num_workers
+            )
+            
+            # Process pages in parallel
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                results = list(executor.map(
+                    lambda img: self.extract_text(np.array(img)),
+                    images
+                ))
+            
+            return [
+                {
+                    'page': i + 1,
+                    'text_blocks': result,
+                    'full_text': ' '.join(r['text'] for r in result)
+                }
+                for i, result in enumerate(results)
+            ]
+            
+        except Exception as e:
+            logger.error(f"PDF error: {e}")
+            return []
+    
+    def batch_process(self, image_paths: List[str], 
+                      parallel: bool = True) -> List[Dict[str, Any]]:
+        """
+        Process multiple images efficiently
+        
+        Args:
+            image_paths: List of image paths
+            parallel: Use parallel processing
+        """
+        if parallel and len(image_paths) > 1:
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                return list(executor.map(self.extract_from_image, image_paths))
+        else:
+            return [self.extract_from_image(path) for path in image_paths]
+    
+    def extract_region(self, image: np.ndarray, bbox: List[float]) -> str:
+        """Extract text from specific region (optimized for speed)"""
+        x1, y1, x2, y2 = map(int, bbox)
         cropped = image[y1:y2, x1:x2]
         
-        # Extract text from cropped region
-        results = self.extract_text(cropped)
-        return [r['text'] for r in results]
-    
-    def visualize_results(self, image: np.ndarray, results: List[Dict], 
-                          output_path: Optional[str] = None) -> np.ndarray:
-        """
-        Visualize OCR results on image
-        """
-        # Create copy for visualization
-        if len(image.shape) == 2:
-            vis_image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-        else:
-            vis_image = image.copy()
+        if cropped.size == 0:
+            return ""
         
-        for result in results:
-            bbox = result['bbox']
-            text = result['text']
-            confidence = result['confidence']
+        # Use simpler PSM for regions
+        results = self.extract_text(cropped, psm=7)  # PSM 7 = single text line
+        return ' '.join(r['text'] for r in results)
+    
+    def visualize(self, image: np.ndarray, results: List[Dict],
+                  output_path: Optional[str] = None, 
+                  show_confidence: bool = True) -> np.ndarray:
+        """Visualize OCR results"""
+        vis = image.copy() if image.ndim == 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        
+        for r in results:
+            x1, y1, x2, y2 = map(int, r['bbox'])
+            color = (0, 255, 0) if r['confidence'] > 0.7 else (255, 165, 0)
             
-            # Draw bounding box
-            x1, y1, x2, y2 = map(int, bbox)
-            cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
             
-            # Add text label
-            label = f"{text[:20]}... ({confidence:.2f})"
-            cv2.putText(vis_image, label, (x1, y1 - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            if show_confidence:
+                label = f"{r['text'][:15]}... {r['confidence']:.0%}"
+                cv2.putText(vis, label, (x1, y1 - 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
         
         if output_path:
-            cv2.imwrite(output_path, cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(output_path, cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
         
-        return vis_image
+        return vis
 
-# Singleton instance for reuse
-_ocr_processor = None
 
-def get_ocr_processor(languages: List[str] = ['eng', 'hin', 'guj']):
-    """
-    Get or create OCR processor instance
-    
-    Args:
-        languages: Language codes ['eng', 'hin', 'guj']
-        
-    Returns:
-        TesseractOCRProcessor instance
-    """
-    global _ocr_processor
-    if _ocr_processor is None:
-        _ocr_processor = TesseractOCRProcessor(languages=languages)
-    
-    # Check if processor initialized properly
-    if not TESSERACT_AVAILABLE:
-        logger.error("Cannot create OCR processor: pytesseract not installed")
-    
-    return _ocr_processor
+# Convenience function
+def get_ocr_processor(languages: List[str] = None) -> EfficientTesseractOCR:
+    """Get OCR processor instance (singleton)"""
+    return EfficientTesseractOCR(languages=languages)
+
 
 if __name__ == "__main__":
-    print("Testing OCR Processor...")
+    print("Testing Efficient OCR Processor...\n")
     
-    # Initialize OCR
-    processor = get_ocr_processor()
+    ocr = get_ocr_processor()
     
     if not TESSERACT_AVAILABLE:
-        print("✗ pytesseract not installed. Please run: pip install pytesseract")
-        print("Then install Tesseract OCR from: https://github.com/UB-Mannheim/tesseract/wiki")
+        print("✗ Install pytesseract: pip install pytesseract")
         exit(1)
     
-    # Create a test image
-    test_image = np.ones((400, 600, 3), dtype=np.uint8) * 255
-    cv2.putText(test_image, "Test Invoice", (50, 100), 
-                cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 3)
-    cv2.putText(test_image, "Dealer: ABC Tractors", (50, 180), 
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
-    cv2.putText(test_image, "Model: 575 DI", (50, 230), 
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
-    cv2.putText(test_image, "Horse Power: 50 HP", (50, 280), 
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
-    cv2.putText(test_image, "Cost: ₹5,25,000", (50, 330), 
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+    # Create test image
+    img = np.ones((400, 600, 3), dtype=np.uint8) * 255
+    test_texts = [
+        ("Test Invoice", 50, 80, 2),
+        ("Dealer: ABC Tractors", 50, 160, 1),
+        ("Model: 575 DI", 50, 210, 1),
+        ("HP: 50", 50, 260, 1),
+        ("Cost: ₹5,25,000", 50, 310, 1)
+    ]
     
-    # Save test image
-    cv2.imwrite("test_ocr.jpg", cv2.cvtColor(test_image, cv2.COLOR_RGB2BGR))
+    for text, x, y, scale in test_texts:
+        cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 2)
     
-    print("Created test image: test_ocr.jpg")
+    cv2.imwrite("test_ocr.jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
     
-    # Extract text
-    results = processor.extract_text(test_image)
-    print(f"\nFound {len(results)} text blocks:")
-    print("=" * 60)
+    # Test extraction
+    import time
+    start = time.time()
+    results = ocr.extract_text(img, min_confidence=0.5)
+    elapsed = time.time() - start
     
-    for i, result in enumerate(results, 1):
-        print(f"{i}. Text: {result['text']}")
-        print(f"   Confidence: {result['confidence']:.2%}")
-        print(f"   Language: {result['language']}")
-        print(f"   BBox: {result['bbox']}")
-        print()
+    print(f"⏱️  Processed in {elapsed:.3f}s")
+    print(f"📄 Found {len(results)} text blocks:\n")
     
-    # Test full extraction
-    print("\nTesting full extraction from file...")
-    full_result = processor.extract_from_image("test_ocr.jpg")
-    print(f"Full text: {full_result.get('full_text', '')[:200]}...")
+    for i, r in enumerate(results, 1):
+        print(f"{i}. {r['text']:<30} [{r['confidence']:.0%}] ({r['language']})")
     
-    print("\n✅ OCR test completed successfully!")
+    # Test batch processing
+    print("\n\n📦 Testing batch processing...")
+    batch_start = time.time()
+    batch_results = ocr.batch_process(["test_ocr.jpg"] * 3, parallel=True)
+    batch_elapsed = time.time() - batch_start
+    print(f"⏱️  Processed 3 images in {batch_elapsed:.3f}s")
+    
+    print("\n✅ All tests completed!")

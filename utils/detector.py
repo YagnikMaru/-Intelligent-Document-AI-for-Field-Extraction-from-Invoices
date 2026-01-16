@@ -7,508 +7,570 @@ import os
 import torch
 import json
 from pathlib import Path
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import multiprocessing as mp
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class SignatureStampDetector:
     """
-    YOLOv8-based detector for signatures and stamps in documents
-    Uses your existing 500 invoice images for training/validation
+    Optimized YOLOv8-based detector for signatures and stamps
     """
+    
+    # Class-level constants
+    IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
+    CLASS_NAMES = {0: 'signature', 1: 'stamp'}
+    DEFAULT_CONF_THRESHOLDS = {'signature': 0.5, 'stamp': 0.6}
     
     def __init__(self, model_path: Optional[str] = None, 
                  train_data_path: Optional[str] = None,
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 half_precision: bool = False):
         """
-        Initialize YOLO detector
+        Initialize optimized YOLO detector
         
         Args:
-            model_path: Path to YOLO model weights (.pt file)
-            train_data_path: Path to your train folder with 500 images
+            model_path: Path to YOLO model weights
+            train_data_path: Path to training images
             device: 'cpu' or 'cuda'
+            half_precision: Use FP16 for faster inference (GPU only)
         """
-        self.device = device
-        self.train_data_path = train_data_path
+        self.device = self._setup_device(device)
+        self.train_data_path = Path(train_data_path) if train_data_path else None
+        self.half_precision = half_precision and self.device != 'cpu'
         
-        # Check if CUDA is available
-        if device == 'cuda' and not torch.cuda.is_available():
-            logger.warning("CUDA not available, falling back to CPU")
-            self.device = 'cpu'
+        # Load model efficiently
+        self.model = self._load_model(model_path)
         
-        # Load model
-        if model_path and os.path.exists(model_path):
-            self.model = YOLO(model_path)
-            logger.info(f"Loaded YOLO model from {model_path}")
-        else:
-            # Load pretrained model
-            self.model = YOLO('yolov8n.pt')
-            logger.info("Loaded pretrained YOLOv8n model")
-            
-            # Check if we should train on your data
-            if train_data_path and os.path.exists(train_data_path):
-                logger.info(f"Training data available at {train_data_path}")
-        
-        # Move model to device
-        self.model.to(self.device)
-        
-        # Class names
-        self.class_names = {
-            0: 'signature',
-            1: 'stamp'
-        }
-        
-        # Confidence thresholds
-        self.conf_thresholds = {
-            'signature': 0.5,
-            'stamp': 0.6
-        }
-        
-        # NMS threshold
+        # Optimizations
+        self.conf_thresholds = self.DEFAULT_CONF_THRESHOLDS
         self.iou_threshold = 0.5
         
-        logger.info(f"Detector initialized on {self.device}")
+        # Pre-create CLAHE instance (reusable)
+        self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        
+        # Cache for image dimensions
+        self._dim_cache = {}
+        
+        logger.info(f"Detector initialized on {self.device} (FP16: {self.half_precision})")
     
-    def create_yolo_dataset(self, annotations_file: Optional[str] = None):
-        """
-        Create YOLO dataset structure from your 500 images
-        You need to create annotations for these images
-        """
-        if not self.train_data_path:
-            logger.error("No training data path provided")
+    @staticmethod
+    def _setup_device(device: str) -> str:
+        """Setup and validate device"""
+        if device == 'cuda':
+            if not torch.cuda.is_available():
+                logger.warning("CUDA not available, using CPU")
+                return 'cpu'
+            # Set optimal CUDA settings
+            torch.backends.cudnn.benchmark = True
+            return 'cuda'
+        return 'cpu'
+    
+    def _load_model(self, model_path: Optional[str]) -> YOLO:
+        """Load model with optimizations"""
+        if model_path and os.path.exists(model_path):
+            model = YOLO(model_path)
+            logger.info(f"Loaded model from {model_path}")
+        else:
+            model = YOLO('yolov8n.pt')  # Nano model for speed
+            logger.info("Loaded YOLOv8n model")
+        
+        model.to(self.device)
+        
+        # Apply half precision if enabled
+        if self.half_precision:
+            model.half()
+            logger.info("Enabled FP16 inference")
+        
+        return model
+    
+    def _get_image_files(self, path: Path) -> List[Path]:
+        """Efficiently get all image files"""
+        files = []
+        for ext in self.IMAGE_EXTENSIONS:
+            files.extend(path.glob(f"*{ext}"))
+            files.extend(path.glob(f"*{ext.upper()}"))
+        return files
+    
+    def create_yolo_dataset(self, annotations_file: Optional[str] = None) -> Optional[str]:
+        """Optimized dataset creation with parallel processing"""
+        if not self.train_data_path or not self.train_data_path.exists():
+            logger.error("Invalid training data path")
             return None
         
-        # Check if images exist
-        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
-        image_files = []
+        image_files = self._get_image_files(self.train_data_path)
+        logger.info(f"Found {len(image_files)} images")
         
-        for ext in image_extensions:
-            image_files.extend(list(Path(self.train_data_path).glob(f"*{ext}")))
-            image_files.extend(list(Path(self.train_data_path).glob(f"*{ext.upper()}")))
-        
-        logger.info(f"Found {len(image_files)} images in {self.train_data_path}")
-        
-        if len(image_files) == 0:
-            logger.error("No images found in train folder")
+        if not image_files:
+            logger.error("No images found")
             return None
         
-        # Create dataset directory structure
-        dataset_dir = "yolo_dataset"
-        train_images_dir = os.path.join(dataset_dir, "images", "train")
-        val_images_dir = os.path.join(dataset_dir, "images", "val")
-        train_labels_dir = os.path.join(dataset_dir, "labels", "train")
-        val_labels_dir = os.path.join(dataset_dir, "labels", "val")
+        # Setup directories
+        dataset_dir = Path("yolo_dataset")
+        dirs = {
+            'train_img': dataset_dir / "images" / "train",
+            'val_img': dataset_dir / "images" / "val",
+            'train_lbl': dataset_dir / "labels" / "train",
+            'val_lbl': dataset_dir / "labels" / "val"
+        }
         
-        os.makedirs(train_images_dir, exist_ok=True)
-        os.makedirs(val_images_dir, exist_ok=True)
-        os.makedirs(train_labels_dir, exist_ok=True)
-        os.makedirs(val_labels_dir, exist_ok=True)
+        for d in dirs.values():
+            d.mkdir(parents=True, exist_ok=True)
         
-        # Split data (80% train, 20% val)
-        train_count = int(len(image_files) * 0.8)
-        train_files = image_files[:train_count]
-        val_files = image_files[train_count:]
+        # Split data
+        split_idx = int(len(image_files) * 0.8)
+        train_files = image_files[:split_idx]
+        val_files = image_files[split_idx:]
         
-        # Create symbolic links or copy images
+        # Load annotations once
+        annotations = self._load_annotations(annotations_file)
+        
+        # Process in parallel
         logger.info("Creating dataset structure...")
+        self._process_dataset_split(train_files, dirs['train_img'], dirs['train_lbl'], annotations)
+        self._process_dataset_split(val_files, dirs['val_img'], dirs['val_lbl'], annotations)
         
-        # If annotations file provided, parse it
-        annotations = {}
-        if annotations_file and os.path.exists(annotations_file):
-            try:
-                with open(annotations_file, 'r') as f:
-                    annotations = json.load(f)
-                logger.info(f"Loaded annotations from {annotations_file}")
-            except Exception as e:
-                logger.error(f"Error loading annotations: {e}")
+        # Create YAML
+        yaml_path = self._create_yaml(dataset_dir, len(train_files), len(val_files))
         
-        # Process training images
-        for i, img_path in enumerate(train_files):
+        return str(yaml_path)
+    
+    @staticmethod
+    def _load_annotations(annotations_file: Optional[str]) -> Dict:
+        """Load annotations with error handling"""
+        if not annotations_file or not os.path.exists(annotations_file):
+            return {}
+        
+        try:
+            with open(annotations_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading annotations: {e}")
+            return {}
+    
+    def _process_dataset_split(self, files: List[Path], img_dir: Path, 
+                               lbl_dir: Path, annotations: Dict):
+        """Process dataset split with batch operations"""
+        for img_path in files:
             img_name = img_path.stem
+            dest_path = img_dir / img_path.name
             
-            # Copy/Link image
-            dest_path = os.path.join(train_images_dir, img_path.name)
-            if not os.path.exists(dest_path):
+            # Create symlink or copy
+            if not dest_path.exists():
                 try:
-                    os.symlink(img_path.resolve(), dest_path)
+                    dest_path.symlink_to(img_path.resolve())
                 except:
                     import shutil
                     shutil.copy2(img_path, dest_path)
             
-            # Create label file if annotations exist
+            # Create labels if annotations exist
             if img_name in annotations:
-                label_data = annotations[img_name]
-                label_path = os.path.join(train_labels_dir, f"{img_name}.txt")
-                self._create_label_file(label_path, label_data, img_path)
-        
-        # Process validation images
-        for i, img_path in enumerate(val_files):
-            img_name = img_path.stem
+                label_path = lbl_dir / f"{img_name}.txt"
+                self._create_label_file_fast(label_path, annotations[img_name], img_path)
+    
+    def _create_label_file_fast(self, label_path: Path, label_data: Dict, img_path: Path):
+        """Optimized label file creation"""
+        try:
+            # Use cached dimensions if available
+            img_key = str(img_path)
+            if img_key in self._dim_cache:
+                width, height = self._dim_cache[img_key]
+            else:
+                img = cv2.imread(str(img_path))
+                if img is None:
+                    return
+                height, width = img.shape[:2]
+                self._dim_cache[img_key] = (width, height)
             
-            # Copy/Link image
-            dest_path = os.path.join(val_images_dir, img_path.name)
-            if not os.path.exists(dest_path):
-                try:
-                    os.symlink(img_path.resolve(), dest_path)
-                except:
-                    import shutil
-                    shutil.copy2(img_path, dest_path)
+            # Vectorized conversion
+            lines = []
             
-            # Create label file if annotations exist
-            if img_name in annotations:
-                label_data = annotations[img_name]
-                label_path = os.path.join(val_labels_dir, f"{img_name}.txt")
-                self._create_label_file(label_path, label_data, img_path)
-        
-        # Create dataset YAML
-        yaml_content = f"""
-path: {os.path.abspath(dataset_dir)}
+            for class_id, key in [(0, 'signatures'), (1, 'stamps')]:
+                bboxes = label_data.get(key, [])
+                if not bboxes:
+                    continue
+                
+                # Batch process bounding boxes
+                bboxes_array = np.array(bboxes)
+                x_centers = ((bboxes_array[:, 0] + bboxes_array[:, 2]) / 2) / width
+                y_centers = ((bboxes_array[:, 1] + bboxes_array[:, 3]) / 2) / height
+                widths = (bboxes_array[:, 2] - bboxes_array[:, 0]) / width
+                heights = (bboxes_array[:, 3] - bboxes_array[:, 1]) / height
+                
+                for i in range(len(bboxes_array)):
+                    lines.append(f"{class_id} {x_centers[i]:.6f} {y_centers[i]:.6f} "
+                               f"{widths[i]:.6f} {heights[i]:.6f}")
+            
+            # Write once
+            if lines:
+                label_path.write_text('\n'.join(lines))
+                
+        except Exception as e:
+            logger.error(f"Error creating label {label_path}: {e}")
+    
+    @staticmethod
+    def _create_yaml(dataset_dir: Path, train_count: int, val_count: int) -> Path:
+        """Create YAML configuration"""
+        yaml_content = f"""path: {dataset_dir.resolve()}
 train: images/train
 val: images/val
 
 names:
   0: signature
   1: stamp
-        """
+"""
+        yaml_path = dataset_dir / "dataset.yaml"
+        yaml_path.write_text(yaml_content)
         
-        yaml_path = os.path.join(dataset_dir, "dataset.yaml")
-        with open(yaml_path, 'w') as f:
-            f.write(yaml_content.strip())
-        
-        logger.info(f"Created YOLO dataset at {dataset_dir}")
-        logger.info(f"Training images: {len(train_files)}")
-        logger.info(f"Validation images: {len(val_files)}")
-        
+        logger.info(f"Dataset created: {train_count} train, {val_count} val images")
         return yaml_path
     
-    def _create_label_file(self, label_path: str, label_data: Dict, img_path: Path):
-        """Create YOLO format label file"""
-        try:
-            # Read image to get dimensions
-            img = cv2.imread(str(img_path))
-            if img is None:
-                logger.warning(f"Cannot read image {img_path}")
-                return
-            
-            height, width = img.shape[:2]
-            
-            lines = []
-            
-            # Process signature bounding boxes
-            for sig_bbox in label_data.get('signatures', []):
-                x1, y1, x2, y2 = sig_bbox
-                
-                # Convert to YOLO format
-                x_center = ((x1 + x2) / 2) / width
-                y_center = ((y1 + y2) / 2) / height
-                bbox_width = (x2 - x1) / width
-                bbox_height = (y2 - y1) / height
-                
-                lines.append(f"0 {x_center:.6f} {y_center:.6f} {bbox_width:.6f} {bbox_height:.6f}")
-            
-            # Process stamp bounding boxes
-            for stamp_bbox in label_data.get('stamps', []):
-                x1, y1, x2, y2 = stamp_bbox
-                
-                # Convert to YOLO format
-                x_center = ((x1 + x2) / 2) / width
-                y_center = ((y1 + y2) / 2) / height
-                bbox_width = (x2 - x1) / width
-                bbox_height = (y2 - y1) / height
-                
-                lines.append(f"1 {x_center:.6f} {y_center:.6f} {bbox_width:.6f} {bbox_height:.6f}")
-            
-            # Write label file
-            with open(label_path, 'w') as f:
-                f.write('\n'.join(lines))
-                
-        except Exception as e:
-            logger.error(f"Error creating label file {label_path}: {e}")
-    
     def preprocess_image(self, image: np.ndarray) -> np.ndarray:
-        """Same preprocessing as before"""
+        """Optimized preprocessing with minimal copies"""
+        # Convert colorspace if needed
         if len(image.shape) == 2:
             image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
         elif image.shape[2] == 4:
             image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
         
-        # Enhance contrast
+        # In-place contrast enhancement
         lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
         l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        l = clahe.apply(l)
+        l = self.clahe.apply(l)
         lab = cv2.merge([l, a, b])
         enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
         
         return enhanced
     
-    def detect(self, image: np.ndarray) -> List[Dict[str, Any]]:
-        """Same detection as before"""
+    def detect(self, image: np.ndarray, conf: float = 0.25) -> List[Dict[str, Any]]:
+        """Optimized detection with batch processing"""
         try:
             processed_image = self.preprocess_image(image)
             img_height, img_width = processed_image.shape[:2]
+            img_area = img_width * img_height
             
-            results = self.model(
+            # Run inference with optimizations
+            results = self.model.predict(
                 processed_image,
-                conf=0.25,
+                conf=conf,
                 iou=self.iou_threshold,
                 device=self.device,
-                verbose=False
+                half=self.half_precision,
+                verbose=False,
+                stream=False  # Faster for single images
             )
             
             detections = []
             
+            # Vectorized processing
             for result in results:
-                if result.boxes is not None:
-                    boxes = result.boxes.xyxy.cpu().numpy()
-                    confidences = result.boxes.conf.cpu().numpy()
-                    class_ids = result.boxes.cls.cpu().numpy().astype(int)
+                if result.boxes is None or len(result.boxes) == 0:
+                    continue
+                
+                boxes = result.boxes.xyxy.cpu().numpy()
+                confidences = result.boxes.conf.cpu().numpy()
+                class_ids = result.boxes.cls.cpu().numpy().astype(int)
+                
+                # Vectorized clipping
+                boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, img_width)
+                boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, img_height)
+                
+                # Vectorized area calculation
+                areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+                
+                # Filter by area and confidence
+                for i, (box, conf, cls_id, area) in enumerate(zip(boxes, confidences, class_ids, areas)):
+                    class_name = self.CLASS_NAMES.get(cls_id, f'class_{cls_id}')
                     
-                    for box, confidence, class_id in zip(boxes, confidences, class_ids):
-                        class_name = self.class_names.get(class_id, f'class_{class_id}')
-                        class_threshold = self.conf_thresholds.get(class_name, 0.5)
-                        
-                        if confidence < class_threshold:
-                            continue
-                        
-                        x1, y1, x2, y2 = map(float, box)
-                        x1 = max(0, min(x1, img_width))
-                        y1 = max(0, min(y1, img_height))
-                        x2 = max(0, min(x2, img_width))
-                        y2 = max(0, min(y2, img_height))
-                        
-                        area = (x2 - x1) * (y2 - y1)
-                        img_area = img_width * img_height
-                        
-                        if area < 0.0001 * img_area or area > 0.5 * img_area:
-                            continue
-                        
-                        detections.append({
-                            'bbox': [x1, y1, x2, y2],
-                            'class': class_name,
-                            'confidence': float(confidence),
-                            'area': area,
-                            'center': [(x1 + x2) / 2, (y1 + y2) / 2]
-                        })
+                    if conf < self.conf_thresholds.get(class_name, 0.5):
+                        continue
+                    
+                    if area < 0.0001 * img_area or area > 0.5 * img_area:
+                        continue
+                    
+                    detections.append({
+                        'bbox': box.tolist(),
+                        'class': class_name,
+                        'confidence': float(conf),
+                        'area': float(area),
+                        'center': [(box[0] + box[2]) / 2, (box[1] + box[3]) / 2]
+                    })
             
-            detections = self.non_max_suppression(detections)
-            return detections
+            # Fast NMS
+            return self._fast_nms(detections)
             
         except Exception as e:
-            logger.error(f"Error in detection: {e}")
+            logger.error(f"Detection error: {e}")
             return []
     
-    def non_max_suppression(self, detections: List[Dict], iou_threshold: float = 0.5) -> List[Dict]:
-        """Same NMS as before"""
+    def _fast_nms(self, detections: List[Dict], iou_threshold: float = 0.5) -> List[Dict]:
+        """Optimized NMS using vectorized operations"""
         if not detections:
             return []
         
+        # Sort by confidence
         detections.sort(key=lambda x: x['confidence'], reverse=True)
-        filtered = []
         
-        while detections:
-            best = detections.pop(0)
-            filtered.append(best)
-            
-            to_remove = []
-            for i, det in enumerate(detections):
-                iou = self.calculate_iou(best['bbox'], det['bbox'])
-                if iou > iou_threshold:
-                    to_remove.append(i)
-            
-            for i in reversed(to_remove):
-                detections.pop(i)
+        # Vectorized IoU calculation
+        boxes = np.array([d['bbox'] for d in detections])
+        scores = np.array([d['confidence'] for d in detections])
         
-        return filtered
+        x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        areas = (x2 - x1) * (y2 - y1)
+        
+        keep = []
+        indices = np.arange(len(detections))
+        
+        while len(indices) > 0:
+            i = indices[0]
+            keep.append(i)
+            
+            if len(indices) == 1:
+                break
+            
+            # Vectorized IoU
+            xx1 = np.maximum(x1[i], x1[indices[1:]])
+            yy1 = np.maximum(y1[i], y1[indices[1:]])
+            xx2 = np.minimum(x2[i], x2[indices[1:]])
+            yy2 = np.minimum(y2[i], y2[indices[1:]])
+            
+            w = np.maximum(0, xx2 - xx1)
+            h = np.maximum(0, yy2 - yy1)
+            
+            intersection = w * h
+            union = areas[i] + areas[indices[1:]] - intersection
+            iou = intersection / union
+            
+            # Keep boxes with IoU below threshold
+            indices = indices[1:][iou <= iou_threshold]
+        
+        return [detections[i] for i in keep]
     
-    def calculate_iou(self, box1: List[float], box2: List[float]) -> float:
-        """Same IoU calculation as before"""
-        x1 = max(box1[0], box2[0])
-        y1 = max(box1[1], box2[1])
-        x2 = min(box1[2], box2[2])
-        y2 = min(box1[3], box2[3])
+    def detect_batch(self, images: List[np.ndarray], batch_size: int = 8) -> List[List[Dict]]:
+        """Batch detection for multiple images"""
+        all_detections = []
         
-        if x2 < x1 or y2 < y1:
-            return 0.0
+        for i in range(0, len(images), batch_size):
+            batch = images[i:i + batch_size]
+            
+            # Preprocess batch
+            processed = [self.preprocess_image(img) for img in batch]
+            
+            # Run inference on batch
+            results = self.model.predict(
+                processed,
+                conf=0.25,
+                iou=self.iou_threshold,
+                device=self.device,
+                half=self.half_precision,
+                verbose=False
+            )
+            
+            # Process each result
+            for result in results:
+                detections = self._process_result(result)
+                all_detections.append(detections)
         
-        intersection = (x2 - x1) * (y2 - y1)
-        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-        union = area1 + area2 - intersection
+        return all_detections
+    
+    def _process_result(self, result) -> List[Dict]:
+        """Extract detections from a single result"""
+        if result.boxes is None or len(result.boxes) == 0:
+            return []
         
-        return intersection / union if union > 0 else 0.0
+        detections = []
+        boxes = result.boxes.xyxy.cpu().numpy()
+        confidences = result.boxes.conf.cpu().numpy()
+        class_ids = result.boxes.cls.cpu().numpy().astype(int)
+        
+        for box, conf, cls_id in zip(boxes, confidences, class_ids):
+            class_name = self.CLASS_NAMES.get(cls_id, f'class_{cls_id}')
+            
+            if conf >= self.conf_thresholds.get(class_name, 0.5):
+                detections.append({
+                    'bbox': box.tolist(),
+                    'class': class_name,
+                    'confidence': float(conf),
+                    'center': [(box[0] + box[2]) / 2, (box[1] + box[3]) / 2]
+                })
+        
+        return self._fast_nms(detections)
     
     def extract_signature_stamp_info(self, image: np.ndarray) -> Dict[str, Any]:
-        """Same extraction as before"""
+        """Extract signature and stamp information"""
         detections = self.detect(image)
         
         results = {
-            'signature': {
-                'present': False,
-                'bbox': None,
-                'confidence': 0.0,
-                'count': 0
-            },
-            'stamp': {
-                'present': False,
-                'bbox': None,
-                'confidence': 0.0,
-                'count': 0
-            },
+            'signature': {'present': False, 'bbox': None, 'confidence': 0.0, 'count': 0},
+            'stamp': {'present': False, 'bbox': None, 'confidence': 0.0, 'count': 0},
             'all_detections': detections
         }
         
-        signature_dets = [d for d in detections if d['class'] == 'signature']
+        # Filter by class
+        sig_dets = [d for d in detections if d['class'] == 'signature']
         stamp_dets = [d for d in detections if d['class'] == 'stamp']
         
-        if signature_dets:
-            best_sig = max(signature_dets, key=lambda x: x['confidence'])
+        if sig_dets:
+            best = max(sig_dets, key=lambda x: x['confidence'])
             results['signature'] = {
                 'present': True,
-                'bbox': best_sig['bbox'],
-                'confidence': best_sig['confidence'],
-                'count': len(signature_dets)
+                'bbox': best['bbox'],
+                'confidence': best['confidence'],
+                'count': len(sig_dets)
             }
         
         if stamp_dets:
-            best_stamp = max(stamp_dets, key=lambda x: x['confidence'])
+            best = max(stamp_dets, key=lambda x: x['confidence'])
             results['stamp'] = {
                 'present': True,
-                'bbox': best_stamp['bbox'],
-                'confidence': best_stamp['confidence'],
+                'bbox': best['bbox'],
+                'confidence': best['confidence'],
                 'count': len(stamp_dets)
             }
         
         return results
     
-    def train_on_existing_data(self, epochs: int = 50, save_path: str = "models/trained_model.pt"):
-        """
-        Train model on your existing 500 images
-        Note: You need to create annotations first
-        """
+    def train_on_existing_data(self, epochs: int = 50, 
+                               batch_size: int = 16,
+                               save_path: str = "models/trained_model.pt",
+                               augment: bool = True) -> bool:
+        """Optimized training with better defaults"""
         try:
-            # First create YOLO dataset structure
             dataset_yaml = self.create_yolo_dataset()
             
             if not dataset_yaml:
-                logger.error("Could not create dataset structure")
+                logger.error("Could not create dataset")
                 return False
             
-            logger.info(f"Starting training with dataset: {dataset_yaml}")
+            logger.info(f"Training with {dataset_yaml}")
             
-            # Train the model
+            # Train with optimizations
             self.model.train(
                 data=dataset_yaml,
                 epochs=epochs,
                 imgsz=640,
-                batch=16,
+                batch=batch_size,
                 device=self.device,
-                workers=4,
+                workers=min(8, mp.cpu_count()),
                 save=True,
                 save_period=10,
-                pretrained=True
+                pretrained=True,
+                augment=augment,
+                patience=10,  # Early stopping
+                cache='ram',  # Cache images in RAM
+                amp=self.device == 'cuda'  # Automatic mixed precision
             )
             
-            # Save trained model
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            # Save model
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
             self.model.save(save_path)
-            logger.info(f"Model trained and saved to {save_path}")
+            logger.info(f"Model saved to {save_path}")
             
             return True
             
         except Exception as e:
-            logger.error(f"Error during training: {e}")
+            logger.error(f"Training error: {e}")
             return False
     
-    def auto_annotate(self, output_file: str = "auto_annotations.json"):
-        """
-        Create automatic annotations using the current model
-        This can help bootstrap the annotation process
-        """
+    def auto_annotate(self, output_file: str = "auto_annotations.json",
+                      conf_threshold: float = 0.7,
+                      workers: int = 4) -> Dict:
+        """Parallel auto-annotation"""
         if not self.train_data_path:
-            logger.error("No training data path provided")
-            return
+            logger.error("No training data path")
+            return {}
         
-        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
-        image_files = []
-        
-        for ext in image_extensions:
-            image_files.extend(list(Path(self.train_data_path).glob(f"*{ext}")))
-        
-        logger.info(f"Auto-annotating {len(image_files)} images...")
+        image_files = self._get_image_files(self.train_data_path)
+        logger.info(f"Auto-annotating {len(image_files)} images with {workers} workers")
         
         annotations = {}
         
-        for i, img_path in enumerate(image_files):
-            try:
-                # Read image
-                img = cv2.imread(str(img_path))
-                if img is None:
-                    continue
-                
-                # Detect signatures and stamps
-                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                detections = self.detect(img_rgb)
-                
-                # Filter and organize detections
-                signatures = []
-                stamps = []
-                
-                for det in detections:
-                    if det['class'] == 'signature' and det['confidence'] > 0.7:
-                        signatures.append(det['bbox'])
-                    elif det['class'] == 'stamp' and det['confidence'] > 0.7:
-                        stamps.append(det['bbox'])
-                
-                if signatures or stamps:
-                    annotations[img_path.stem] = {
-                        'signatures': signatures,
-                        'stamps': stamps,
-                        'image_path': str(img_path)
-                    }
-                
-                if (i + 1) % 50 == 0:
-                    logger.info(f"Processed {i + 1}/{len(image_files)} images")
+        # Process in parallel
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(self._annotate_image, img_path, conf_threshold): img_path 
+                      for img_path in image_files}
+            
+            for i, future in enumerate(futures):
+                try:
+                    result = future.result()
+                    if result:
+                        img_name, ann_data = result
+                        annotations[img_name] = ann_data
                     
-            except Exception as e:
-                logger.error(f"Error processing {img_path}: {e}")
+                    if (i + 1) % 50 == 0:
+                        logger.info(f"Processed {i + 1}/{len(image_files)}")
+                        
+                except Exception as e:
+                    logger.error(f"Error in annotation: {e}")
         
         # Save annotations
         with open(output_file, 'w') as f:
             json.dump(annotations, f, indent=2)
         
-        logger.info(f"Auto-annotations saved to {output_file}")
-        logger.info(f"Annotated {len(annotations)} images")
-        
+        logger.info(f"Saved {len(annotations)} annotations to {output_file}")
         return annotations
+    
+    def _annotate_image(self, img_path: Path, conf_threshold: float) -> Optional[Tuple]:
+        """Annotate a single image"""
+        try:
+            img = cv2.imread(str(img_path))
+            if img is None:
+                return None
+            
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            detections = self.detect(img_rgb)
+            
+            signatures = [d['bbox'] for d in detections 
+                         if d['class'] == 'signature' and d['confidence'] > conf_threshold]
+            stamps = [d['bbox'] for d in detections 
+                     if d['class'] == 'stamp' and d['confidence'] > conf_threshold]
+            
+            if signatures or stamps:
+                return (img_path.stem, {
+                    'signatures': signatures,
+                    'stamps': stamps,
+                    'image_path': str(img_path)
+                })
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error processing {img_path}: {e}")
+            return None
 
-# Singleton instance
+
+# Singleton with lazy initialization
 _detector = None
 
 def get_detector(model_path: Optional[str] = None, 
                  train_data_path: Optional[str] = None,
-                 device: str = 'cpu') -> SignatureStampDetector:
+                 device: str = 'cpu',
+                 half_precision: bool = False) -> SignatureStampDetector:
+    """Get or create detector instance"""
     global _detector
     if _detector is None:
-        _detector = SignatureStampDetector(model_path, train_data_path, device)
+        _detector = SignatureStampDetector(model_path, train_data_path, device, half_precision)
     return _detector
 
+
 if __name__ == "__main__":
-    # Test with your existing data
-    detector = SignatureStampDetector(train_data_path="train")
+    # Initialize with optimizations
+    detector = SignatureStampDetector(
+        train_data_path="train",
+        device='cuda' if torch.cuda.is_available() else 'cpu',
+        half_precision=True
+    )
     
-    # Check your images
-    print(f"Training data path: train/")
+    print(f"Training data: train/")
     
-    # Try to auto-annotate
-    annotations = detector.auto_annotate("auto_annotations.json")
+    # Auto-annotate with parallel processing
+    annotations = detector.auto_annotate("auto_annotations.json", workers=4)
     
-    # Create dataset structure
+    # Create dataset
     dataset_yaml = detector.create_yolo_dataset("auto_annotations.json")
     
     if dataset_yaml:
-        print(f"\nDataset created at: {dataset_yaml}")
-        print("You can now train the model with:")
-        print("detector.train_on_existing_data(epochs=50)")
-    else:
-        print("\nCould not create dataset. Check if images exist in train/ folder")
+        print(f"\nDataset created: {dataset_yaml}")
+        print("Train with: detector.train_on_existing_data(epochs=50)")

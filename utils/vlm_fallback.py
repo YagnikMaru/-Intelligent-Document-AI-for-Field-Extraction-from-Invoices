@@ -3,690 +3,575 @@ from transformers import AutoProcessor, AutoModelForVision2Seq
 from PIL import Image
 import json
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 import re
-import time
+from functools import lru_cache
+from dataclasses import dataclass
+from enum import Enum
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-class VLMProcessor:
-    """
-    Vision Language Model fallback for complex document understanding
-    Uses Qwen2.5-VL for multilingual document analysis
-    """
+
+class Language(Enum):
+    """Supported languages"""
+    ENGLISH = ("english", "en", "eng")
+    HINDI = ("hindi", "hi", "hin")
+    GUJARATI = ("gujarati", "gu", "guj")
     
-    def __init__(self, model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct", device: str = None):
+    @classmethod
+    def detect(cls, lang_str: str) -> 'Language':
+        """Detect language from string"""
+        lang_lower = lang_str.lower()
+        for lang in cls:
+            if lang_lower in lang.value:
+                return lang
+        return cls.ENGLISH
+
+
+@dataclass
+class ExtractionResult:
+    """Structured extraction result"""
+    dealer_name: Optional[str] = None
+    model_name: Optional[str] = None
+    horse_power: Optional[float] = None
+    asset_cost: Optional[float] = None
+    signature_present: bool = False
+    stamp_present: bool = False
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary"""
+        return {
+            'dealer_name': self.dealer_name,
+            'model_name': self.model_name,
+            'horse_power': self.horse_power,
+            'asset_cost': self.asset_cost,
+            'signature_present': self.signature_present,
+            'stamp_present': self.stamp_present
+        }
+
+
+class EfficientVLMProcessor:
+    """Optimized Vision Language Model processor with caching and batch support"""
+    
+    _instance = None
+    _initialized = False
+    
+    # Pre-compiled patterns (class-level)
+    _JSON_PATTERN = re.compile(r'\{.*?\}', re.DOTALL)
+    _NUMBER_PATTERN = re.compile(r'\d+\.?\d*')
+    _FIELD_PATTERNS = {
+        'dealer': [
+            re.compile(r'dealer[:\s]+([^\n,]+)', re.I),
+            re.compile(r'डीलर[:\s]+([^\n,]+)', re.I),
+            re.compile(r'ડીલર[:\s]+([^\n,]+)', re.I)
+        ],
+        'model': [
+            re.compile(r'model[:\s]+([A-Za-z0-9\s\-]+)', re.I),
+            re.compile(r'मॉडल[:\s]+([^\n,]+)', re.I),
+            re.compile(r'મોડેલ[:\s]+([^\n,]+)', re.I)
+        ],
+        'hp': [
+            re.compile(r'horse[-\s]*power[:\s]*(\d+(?:\.\d+)?)', re.I),
+            re.compile(r'HP[:\s]*(\d+(?:\.\d+)?)', re.I),
+            re.compile(r'हॉर्स पावर[:\s]*(\d+(?:\.\d+)?)', re.I)
+        ],
+        'cost': [
+            re.compile(r'cost[:\s]*[₹$Rs]?\s*(\d[\d,]*\.?\d*)', re.I),
+            re.compile(r'लागत[:\s]*[₹रु]?\s*(\d[\d,]*)', re.I),
+            re.compile(r'ખર્ચ[:\s]*[₹રૂ]?\s*(\d[\d,]*)', re.I)
+        ]
+    }
+    
+    def __new__(cls, *args, **kwargs):
+        """Singleton pattern"""
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def __init__(self, model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct", 
+                 device: str = None, max_batch_size: int = 4):
         """
-        Initialize VLM processor
-        
         Args:
-            model_name: Hugging Face model name
+            model_name: HuggingFace model name
             device: 'cpu', 'cuda', or None (auto)
+            max_batch_size: Maximum batch size for processing
         """
+        if self._initialized:
+            return
+        
         self.model_name = model_name
+        self.max_batch_size = max_batch_size
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = None
+        self.processor = None
         
-        # Auto detect device
-        if device is None:
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        else:
-            self.device = device
-        
-        logger.info(f"Loading VLM model: {model_name} on {self.device}")
+        self._load_model()
+        self._initialized = True
+    
+    def _load_model(self):
+        """Load model with optimizations"""
+        logger.info(f"Loading VLM: {self.model_name} on {self.device}")
         
         try:
-            # Load processor and model
+            # Use bfloat16 on CUDA for better performance
+            dtype = torch.bfloat16 if self.device == "cuda" and torch.cuda.is_bf16_supported() else (
+                torch.float16 if self.device == "cuda" else torch.float32
+            )
+            
             self.processor = AutoProcessor.from_pretrained(
-                model_name, 
-                trust_remote_code=True
+                self.model_name, trust_remote_code=True
             )
             
             self.model = AutoModelForVision2Seq.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                self.model_name,
+                torch_dtype=dtype,
                 device_map=self.device,
-                trust_remote_code=True
+                trust_remote_code=True,
+                low_cpu_mem_usage=True  # Efficient loading
             )
             
-            logger.info(f"VLM model loaded successfully")
+            # Set to eval mode for inference
+            self.model.eval()
+            
+            # Enable gradient checkpointing for memory efficiency if available
+            if hasattr(self.model, 'gradient_checkpointing_enable'):
+                self.model.gradient_checkpointing_enable()
+            
+            logger.info(f"✓ VLM loaded (dtype: {dtype})")
             
         except Exception as e:
-            logger.error(f"Failed to load VLM model: {e}")
+            logger.error(f"✗ Failed to load VLM: {e}")
             self.model = None
             self.processor = None
     
     def is_available(self) -> bool:
-        """Check if VLM is available"""
+        """Check if VLM is ready"""
         return self.model is not None and self.processor is not None
     
-    def extract_fields_vlm(self, image: Image.Image, 
-                          ocr_text: str = "",
-                          language: str = "English") -> Dict[str, Any]:
-        """
-        Extract fields using VLM
+    @lru_cache(maxsize=3)
+    def _get_prompt(self, language: Language, ocr_context: str = "") -> str:
+        """Cached prompt generation"""
+        context = f'OCR context: "{ocr_context[:300]}..."' if ocr_context else ""
         
-        Args:
-            image: PIL Image
-            ocr_text: Extracted OCR text for context
-            language: Language of the document
-            
-        Returns:
-            Dictionary with extracted fields
-        """
-        if not self.is_available():
-            logger.error("VLM model not available")
-            return {}
-        
-        try:
-            start_time = time.time()
-            
-            # Construct prompt based on language
-            if language.lower() in ["hindi", "hi"]:
-                prompt = self._create_hindi_prompt(ocr_text)
-            elif language.lower() in ["gujarati", "gu"]:
-                prompt = self._create_gujarati_prompt(ocr_text)
-            else:
-                prompt = self._create_english_prompt(ocr_text)
-            
-            # Prepare messages
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": prompt}
-                    ]
-                }
-            ]
-            
-            # Prepare inputs
-            text = self.processor.apply_chat_template(
-                messages, 
-                tokenize=False, 
-                add_generation_prompt=True
-            )
-            
-            inputs = self.processor(
-                text=[text],
-                images=[image],
-                padding=True,
-                return_tensors="pt"
-            ).to(self.device)
-            
-            # Generate response
-            with torch.no_grad():
-                generated_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=512,
-                    do_sample=False
-                )
-            
-            # Decode response
-            generated_text = self.processor.decode(
-                generated_ids[0], 
-                skip_special_tokens=True
-            )
-            
-            # Extract JSON from response
-            extracted_data = self._parse_vlm_response(generated_text)
-            
-            processing_time = time.time() - start_time
-            logger.info(f"VLM processing completed in {processing_time:.2f}s")
-            
-            return extracted_data
-            
-        except Exception as e:
-            logger.error(f"Error in VLM extraction: {e}")
-            return {}
-    
-    def _create_english_prompt(self, ocr_text: str) -> str:
-        """Create English prompt for VLM"""
-        return f"""Analyze this invoice document and extract the following fields in JSON format:
+        prompts = {
+            Language.ENGLISH: f"""Extract invoice fields as JSON:
+{context}
 
-OCR Text for reference: "{ocr_text[:500]}..."
+Required: dealer_name, model_name, horse_power (number), asset_cost (number), 
+signature_present (bool), stamp_present (bool)
 
-Required fields:
-1. dealer_name: Name of the dealer/seller/vendor
-2. model_name: Model name of the tractor/asset
-3. horse_power: Horse power value as a number
-4. asset_cost: Total cost as a number (remove currency symbols)
-5. signature_present: True/False if signature is present
-6. stamp_present: True/False if stamp/seal is present
+Rules:
+- Extract exact values only
+- Use null for missing fields
+- Numbers only for numeric fields
+- Return valid JSON only
 
-Instructions:
-- Extract exact text values, don't invent information
-- If a field is not found, use null
-- Return ONLY valid JSON, no explanations
-- For numeric fields, extract only the number
-- For dealer name, look for words like: Dealer, Seller, Vendor, Supplier
-- For model name, look for patterns like: 575 DI, 485 XP, etc.
-- For horse power, look for: HP, H.P., Horse Power
-- For cost, look for: ₹, Rs, Total, Amount, Cost
-
-Return format:
-{{
-  "dealer_name": "string or null",
-  "model_name": "string or null",
-  "horse_power": number or null,
-  "asset_cost": number or null,
-  "signature_present": boolean,
-  "stamp_present": boolean
-}}"""
-    
-    def _create_hindi_prompt(self, ocr_text: str) -> str:
-        """Create Hindi prompt for VLM"""
-        return f"""इस इनवॉइस दस्तावेज़ का विश्लेषण करें और निम्नलिखित फ़ील्ड्स JSON प्रारूप में निकालें:
-
-संदर्भ के लिए OCR टेक्स्ट: "{ocr_text[:500]}..."
-
-आवश्यक फ़ील्ड्स:
-1. dealer_name: डीलर/विक्रेता/वेंडर का नाम
-2. model_name: ट्रैक्टर/संपत्ति का मॉडल नाम
-3. horse_power: हॉर्स पावर मान संख्या के रूप में
-4. asset_cost: कुल लागत संख्या के रूप में (मुद्रा प्रतीक हटाएं)
-5. signature_present: हस्ताक्षर मौजूद है तो True/False
-6. stamp_present: स्टैम्प/मोहर मौजूद है तो True/False
-
-निर्देश:
-- सटीक टेक्स्ट मान निकालें, जानकारी आविष्कार न करें
-- यदि फ़ील्ड नहीं मिलता है, तो null का उपयोग करें
-- केवल वैध JSON लौटाएं, कोई स्पष्टीकरण नहीं
-- संख्यात्मक फ़ील्ड्स के लिए, केवल संख्या निकालें
-- डीलर नाम के लिए देखें: डीलर, विक्रेता, वेंडर, आपूर्तिकर्ता
-- मॉडल नाम के लिए देखें: 575 DI, 485 XP, आदि।
-- हॉर्स पावर के लिए देखें: HP, H.P., हॉर्स पावर
-- लागत के लिए देखें: ₹, रु, कुल, राशि, लागत
-
-लौटाने का प्रारूप:
-{{
-  "dealer_name": "string या null",
-  "model_name": "string या null",
-  "horse_power": number या null,
-  "asset_cost": number या null,
-  "signature_present": boolean,
-  "stamp_present": boolean
-}}"""
-    
-    def _create_gujarati_prompt(self, ocr_text: str) -> str:
-        """Create Gujarati prompt for VLM"""
-        return f"""આ ઇનવોઇસ દસ્તાવેજનું વિશ્લેષણ કરો અને નીચેની ફીલ્ડ્સ JSON ફોર્મેટમાં કાઢો:
-
-સંદર્ભ માટે OCR ટેક્સ્ટ: "{ocr_text[:500]}..."
-
-જરૂરી ફીલ્ડ્સ:
-1. dealer_name: ડીલર/વિક્રેતા/વેન્ડરનું નામ
-2. model_name: ટ્રેક્ટર/એસેટનું મોડેલ નામ
-3. horse_power: હોર્સ પાવર મૂલ્ય નંબર તરીકે
-4. asset_cost: કુલ ખર્ચ નંબર તરીકે (કરન્સી ચિહ્નો દૂર કરો)
-5. signature_present: સહી હાજર છે તો True/False
-6. stamp_present: સ્ટેમ્પ/સીલ હાજર છે તો True/False
-
-સૂચનાઓ:
-- ચોક્કસ ટેક્સ્ટ મૂલ્યો કાઢો, માહિતી શોધશોળ ન કરો
-- જો ફીલ્ડ ન મળે, તો null વાપરો
-- ફક્ત માન્ય JSON પરત કરો, કોઈ સમજૂતી નહીં
-- ન્યૂમેરિક ફીલ્ડ્સ માટે, ફક્ત નંબર કાઢો
-- ડીલર નામ માટે જુઓ: ડીલર, વિક્રેતા, વેન્ડર, સપ્લાયર
-- મોડેલ નામ માટે જુઓ: 575 DI, 485 XP, વગેરે.
-- હોર્સ પાવર માટે જુઓ: HP, H.P., હોર્સ પાવર
-- ખર્ચ માટે જુઓ: ₹, રૂ, કુલ, રકમ, ખર્ચ
-
-પરત કરવાનું ફોર્મેટ:
-{{
-  "dealer_name": "string અથવા null",
-  "model_name": "string અથવા null",
-  "horse_power": number અથવા null,
-  "asset_cost": number અથવા null,
-  "signature_present": boolean,
-  "stamp_present": boolean
-}}"""
-    
-    def _parse_vlm_response(self, response: str) -> Dict[str, Any]:
-        """
-        Parse VLM response and extract JSON
-        
-        Args:
-            response: VLM generated response
+Format:
+{{"dealer_name": null, "model_name": null, "horse_power": null, 
+"asset_cost": null, "signature_present": false, "stamp_present": false}}""",
             
-        Returns:
-            Parsed dictionary
-        """
-        try:
-            # Try to find JSON in the response
-            json_pattern = r'\{.*\}'
-            match = re.search(json_pattern, response, re.DOTALL)
+            Language.HINDI: f"""JSON प्रारूप में इनवॉइस फ़ील्ड निकालें:
+{context}
+
+आवश्यक: dealer_name, model_name, horse_power (संख्या), asset_cost (संख्या),
+signature_present (bool), stamp_present (bool)
+
+JSON लौटाएं।""",
             
-            if match:
-                json_str = match.group(0)
-                
-                # Clean up common issues
-                json_str = json_str.replace('```json', '').replace('```', '')
-                json_str = json_str.strip()
-                
-                # Parse JSON
-                data = json.loads(json_str)
-                
-                # Validate and clean data
-                cleaned_data = {}
-                
-                for key in ['dealer_name', 'model_name', 'horse_power', 'asset_cost', 
-                           'signature_present', 'stamp_present']:
-                    if key in data:
-                        value = data[key]
-                        
-                        # Handle null/None
-                        if value in [None, 'null', 'NULL', 'None', 'N/A', '']:
-                            cleaned_data[key] = None
-                        
-                        # Clean strings
-                        elif isinstance(value, str):
-                            if key in ['horse_power', 'asset_cost']:
-                                # Extract numbers from strings
-                                numbers = re.findall(r'\d+\.?\d*', value.replace(',', ''))
-                                if numbers:
-                                    try:
-                                        cleaned_data[key] = float(numbers[0])
-                                    except:
-                                        cleaned_data[key] = None
-                                else:
-                                    cleaned_data[key] = None
-                            else:
-                                cleaned_data[key] = value.strip()
-                        
-                        # Handle booleans
-                        elif isinstance(value, bool):
-                            cleaned_data[key] = value
-                        
-                        # Handle numbers
-                        elif isinstance(value, (int, float)):
-                            cleaned_data[key] = value
-                        
-                        else:
-                            cleaned_data[key] = None
-                    
-                    else:
-                        cleaned_data[key] = None
-                
-                return cleaned_data
-            
-            else:
-                logger.warning("No JSON found in VLM response")
-                return self._extract_fields_heuristic(response)
-                
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse JSON: {e}")
-            return self._extract_fields_heuristic(response)
-        
-        except Exception as e:
-            logger.error(f"Error parsing VLM response: {e}")
-            return {}
-    
-    def _extract_fields_heuristic(self, response: str) -> Dict[str, Any]:
-        """
-        Extract fields using heuristics when JSON parsing fails
-        
-        Args:
-            response: VLM response text
-            
-        Returns:
-            Dictionary with extracted fields
-        """
-        extracted = {
-            'dealer_name': None,
-            'model_name': None,
-            'horse_power': None,
-            'asset_cost': None,
-            'signature_present': False,
-            'stamp_present': False
+            Language.GUJARATI: f"""JSON ફોર્મેટમાં ઇનવોઇસ ફીલ્ડ્સ કાઢો:
+{context}
+
+જરૂરી: dealer_name, model_name, horse_power (નંબર), asset_cost (નંબર),
+signature_present (bool), stamp_present (bool)
+
+JSON પરત કરો।"""
         }
         
-        try:
-            # Extract dealer name
-            dealer_patterns = [
-                r'dealer[:\s]+([^\n,]+)',
-                r'dealer_name[:\s]+([^\n,]+)',
-                r'डीलर[:\s]+([^\n,]+)',
-                r'ડીલર[:\s]+([^\n,]+)'
-            ]
-            
-            for pattern in dealer_patterns:
-                match = re.search(pattern, response, re.IGNORECASE)
-                if match:
-                    extracted['dealer_name'] = match.group(1).strip()
-                    break
-            
-            # Extract model name
-            model_patterns = [
-                r'model[:\s]+([A-Za-z0-9\s\-]+)',
-                r'model_name[:\s]+([A-Za-z0-9\s\-]+)',
-                r'मॉडल[:\s]+([^\n,]+)',
-                r'મોડેલ[:\s]+([^\n,]+)'
-            ]
-            
-            for pattern in model_patterns:
-                match = re.search(pattern, response, re.IGNORECASE)
-                if match:
-                    extracted['model_name'] = match.group(1).strip()
-                    break
-            
-            # Extract horse power
-            hp_patterns = [
-                r'horse[-\s]*power[:\s]*(\d+(?:\.\d+)?)',
-                r'HP[:\s]*(\d+(?:\.\d+)?)',
-                r'हॉर्स पावर[:\s]*(\d+(?:\.\d+)?)',
-                r'હોર્સ પાવર[:\s]*(\d+(?:\.\d+)?)'
-            ]
-            
-            for pattern in hp_patterns:
-                match = re.search(pattern, response, re.IGNORECASE)
-                if match:
-                    try:
-                        extracted['horse_power'] = float(match.group(1))
-                    except:
-                        pass
-                    break
-            
-            # Extract asset cost
-            cost_patterns = [
-                r'cost[:\s]*[₹$Rs]?\s*(\d[\d,]*\.?\d*)',
-                r'asset[-\s]*cost[:\s]*[₹$Rs]?\s*(\d[\d,]*\.?\d*)',
-                r'लागत[:\s]*[₹रु]?\s*(\d[\d,]*)',
-                r'ખર્ચ[:\s]*[₹રૂ]?\s*(\d[\d,]*)'
-            ]
-            
-            for pattern in cost_patterns:
-                match = re.search(pattern, response, re.IGNORECASE)
-                if match:
-                    try:
-                        cost_str = match.group(1).replace(',', '')
-                        extracted['asset_cost'] = float(cost_str)
-                    except:
-                        pass
-                    break
-            
-            # Extract signature presence
-            sig_patterns = [
-                r'signature[-\s]*present[:\s]*(true|false)',
-                r'हस्ताक्षर[-\s]*मौजूद[:\s]*(हाँ|नहीं|true|false)',
-                r'સહી[-\s]*હાજર[:\s]*(હા|ના|true|false)'
-            ]
-            
-            for pattern in sig_patterns:
-                match = re.search(pattern, response, re.IGNORECASE)
-                if match:
-                    value = match.group(1).lower()
-                    extracted['signature_present'] = value in ['true', 'हाँ', 'हा', 'yes']
-                    break
-            
-            # Extract stamp presence
-            stamp_patterns = [
-                r'stamp[-\s]*present[:\s]*(true|false)',
-                r'स्टैम्प[-\s]*मौजूद[:\s]*(हाँ|नहीं|true|false)',
-                r'સ્ટેમ્પ[-\s]*હાજર[:\s]*(હા|ના|true|false)'
-            ]
-            
-            for pattern in stamp_patterns:
-                match = re.search(pattern, response, re.IGNORECASE)
-                if match:
-                    value = match.group(1).lower()
-                    extracted['stamp_present'] = value in ['true', 'हाँ', 'हा', 'yes']
-                    break
-            
-            return extracted
-            
-        except Exception as e:
-            logger.error(f"Error in heuristic extraction: {e}")
-            return extracted
+        return prompts.get(language, prompts[Language.ENGLISH])
     
-    def analyze_document_layout(self, image: Image.Image) -> Dict[str, Any]:
+    def extract_fields(self, image: Image.Image, ocr_text: str = "",
+                      language: str = "english") -> ExtractionResult:
         """
-        Analyze document layout for better understanding
+        Extract fields using VLM (optimized)
         
         Args:
             image: PIL Image
+            ocr_text: OCR context (truncated automatically)
+            language: Document language
             
         Returns:
-            Layout analysis results
+            ExtractionResult object
         """
         if not self.is_available():
-            return {}
-        
-        prompt = """Analyze this document and describe its layout structure.
-        Identify key sections like: header, dealer information, model specifications, 
-        pricing, signature area, stamp area.
-        Return JSON with:
-        {
-          "layout_description": "brief description",
-          "has_signature_area": true/false,
-          "has_stamp_area": true/false,
-          "main_sections": ["section1", "section2", ...]
-        }"""
+            logger.error("VLM not available")
+            return ExtractionResult()
         
         try:
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": prompt}
-                    ]
-                }
-            ]
+            lang = Language.detect(language)
+            prompt = self._get_prompt(lang, ocr_text[:300])
+            
+            # Prepare input
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": prompt}
+                ]
+            }]
             
             text = self.processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
             
             inputs = self.processor(
-                text=[text],
-                images=[image],
-                padding=True,
-                return_tensors="pt"
+                text=[text], images=[image],
+                padding=True, return_tensors="pt"
             ).to(self.device)
             
-            with torch.no_grad():
-                generated_ids = self.model.generate(
+            # Generate with optimizations
+            with torch.inference_mode():  # More efficient than no_grad
+                outputs = self.model.generate(
                     **inputs,
-                    max_new_tokens=256,
-                    do_sample=False
+                    max_new_tokens=384,  # Reduced from 512
+                    do_sample=False,
+                    num_beams=1,  # Greedy decoding (fastest)
+                    early_stopping=True
                 )
             
-            generated_text = self.processor.decode(
-                generated_ids[0], skip_special_tokens=True
-            )
+            # Decode
+            response = self.processor.batch_decode(
+                outputs, skip_special_tokens=True
+            )[0]
             
-            # Parse layout response
-            json_pattern = r'\{.*\}'
-            match = re.search(json_pattern, generated_text, re.DOTALL)
-            
-            if match:
-                layout_data = json.loads(match.group(0))
-                return layout_data
-            
-            return {}
+            # Parse response
+            return self._parse_response(response)
             
         except Exception as e:
-            logger.error(f"Error in layout analysis: {e}")
-            return {}
+            logger.error(f"VLM extraction error: {e}")
+            return ExtractionResult()
+    
+    def batch_extract(self, images: List[Image.Image], 
+                     ocr_texts: List[str] = None,
+                     language: str = "english") -> List[ExtractionResult]:
+        """
+        Batch process multiple images efficiently
+        
+        Args:
+            images: List of PIL Images
+            ocr_texts: Optional list of OCR contexts
+            language: Document language
+            
+        Returns:
+            List of ExtractionResult objects
+        """
+        if not self.is_available():
+            return [ExtractionResult() for _ in images]
+        
+        ocr_texts = ocr_texts or [""] * len(images)
+        results = []
+        
+        # Process in batches
+        for i in range(0, len(images), self.max_batch_size):
+            batch_imgs = images[i:i + self.max_batch_size]
+            batch_ocr = ocr_texts[i:i + self.max_batch_size]
+            
+            batch_results = self._process_batch(batch_imgs, batch_ocr, language)
+            results.extend(batch_results)
+        
+        return results
+    
+    def _process_batch(self, images: List[Image.Image], 
+                      ocr_texts: List[str], language: str) -> List[ExtractionResult]:
+        """Process a batch of images"""
+        try:
+            lang = Language.detect(language)
+            prompts = [self._get_prompt(lang, ocr[:300]) for ocr in ocr_texts]
+            
+            # Prepare batch inputs
+            messages_batch = [
+                [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": prompt}
+                    ]
+                }]
+                for prompt in prompts
+            ]
+            
+            texts = [
+                self.processor.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True
+                )
+                for msgs in messages_batch
+            ]
+            
+            inputs = self.processor(
+                text=texts, images=images,
+                padding=True, return_tensors="pt"
+            ).to(self.device)
+            
+            with torch.inference_mode():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=384,
+                    do_sample=False,
+                    num_beams=1
+                )
+            
+            responses = self.processor.batch_decode(outputs, skip_special_tokens=True)
+            
+            return [self._parse_response(resp) for resp in responses]
+            
+        except Exception as e:
+            logger.error(f"Batch processing error: {e}")
+            return [ExtractionResult() for _ in images]
+    
+    def _parse_response(self, response: str) -> ExtractionResult:
+        """Parse VLM response efficiently"""
+        try:
+            # Try JSON parsing first
+            match = self._JSON_PATTERN.search(response)
+            if match:
+                data = json.loads(match.group(0).replace('```json', '').replace('```', '').strip())
+                return self._dict_to_result(data)
+            
+            # Fallback to pattern matching
+            return self._extract_with_patterns(response)
+            
+        except json.JSONDecodeError:
+            return self._extract_with_patterns(response)
+        except Exception as e:
+            logger.debug(f"Parse error: {e}")
+            return ExtractionResult()
+    
+    def _dict_to_result(self, data: Dict[str, Any]) -> ExtractionResult:
+        """Convert dict to ExtractionResult with validation"""
+        def safe_str(v): return str(v).strip() if v and v not in ('null', 'None', '') else None
+        def safe_num(v): 
+            if isinstance(v, (int, float)): return float(v)
+            if isinstance(v, str):
+                nums = self._NUMBER_PATTERN.findall(v.replace(',', ''))
+                return float(nums[0]) if nums else None
+            return None
+        def safe_bool(v): return bool(v) if isinstance(v, bool) else v in (True, 'true', 'True')
+        
+        return ExtractionResult(
+            dealer_name=safe_str(data.get('dealer_name')),
+            model_name=safe_str(data.get('model_name')),
+            horse_power=safe_num(data.get('horse_power')),
+            asset_cost=safe_num(data.get('asset_cost')),
+            signature_present=safe_bool(data.get('signature_present', False)),
+            stamp_present=safe_bool(data.get('stamp_present', False))
+        )
+    
+    def _extract_with_patterns(self, text: str) -> ExtractionResult:
+        """Pattern-based extraction fallback"""
+        result = ExtractionResult()
+        
+        # Extract dealer
+        for pattern in self._FIELD_PATTERNS['dealer']:
+            if match := pattern.search(text):
+                result.dealer_name = match.group(1).strip()
+                break
+        
+        # Extract model
+        for pattern in self._FIELD_PATTERNS['model']:
+            if match := pattern.search(text):
+                result.model_name = match.group(1).strip()
+                break
+        
+        # Extract HP
+        for pattern in self._FIELD_PATTERNS['hp']:
+            if match := pattern.search(text):
+                try:
+                    result.horse_power = float(match.group(1))
+                except: pass
+                break
+        
+        # Extract cost
+        for pattern in self._FIELD_PATTERNS['cost']:
+            if match := pattern.search(text):
+                try:
+                    result.asset_cost = float(match.group(1).replace(',', ''))
+                except: pass
+                break
+        
+        return result
 
-# Singleton instance
-_vlm_processor = None
 
 def get_vlm_processor(model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct", 
-                      device: str = None) -> VLMProcessor:
-    """
-    Get or create VLM processor instance
-    
-    Args:
-        model_name: Model name
-        device: Device to use
-        
-    Returns:
-        VLMProcessor instance
-    """
-    global _vlm_processor
-    if _vlm_processor is None:
-        _vlm_processor = VLMProcessor(model_name, device)
-    return _vlm_processor
+            device: str = None) -> EfficientVLMProcessor:
+    """Get VLM processor instance (singleton)"""
+    return EfficientVLMProcessor(model_name, device)
 
-def should_use_vlm_fallback(rule_based_results: Dict[str, Any], 
-                           confidence_threshold: float = 0.7) -> bool:
+
+def should_use_vlm_fallback(rule_results: Dict[str, Any], 
+                   confidence_threshold: float = 0.7,
+                   min_fields_threshold: int = 2) -> bool:
     """
-    Determine if VLM fallback should be used
+    Determine if VLM fallback is needed
     
     Args:
-        rule_based_results: Results from rule-based extraction
-        confidence_threshold: Confidence threshold for fallback
+        rule_results: Rule-based extraction results
+        confidence_threshold: Overall confidence threshold
+        min_fields_threshold: Min number of low-confidence fields to trigger
         
     Returns:
-        True if VLM fallback should be used
+        True if VLM should be used
     """
-    # Check overall confidence
-    overall_confidence = rule_based_results.get('overall_confidence', 0)
-    if overall_confidence < confidence_threshold:
+    overall = rule_results.get('overall_confidence', 0)
+    if overall < confidence_threshold:
         return True
     
-    # Check individual field confidences
-    required_fields = ['dealer_name', 'model_name', 'horse_power', 'asset_cost']
-    missing_or_low = 0
+    # Check critical fields
+    critical = ['dealer_name', 'model_name', 'horse_power', 'asset_cost']
+    low_conf_count = sum(
+        1 for field in critical
+        if field in rule_results and (
+            rule_results[field].get('value') is None or
+            rule_results[field].get('confidence', 0) < 0.6
+        )
+    )
     
-    for field in required_fields:
-        field_data = rule_based_results.get(field, {})
-        if field_data.get('value') is None or field_data.get('confidence', 0) < 0.6:
-            missing_or_low += 1
-    
-    # If more than 1 field is missing or low confidence, use VLM
-    return missing_or_low > 1
+    return low_conf_count >= min_fields_threshold
 
-def merge_results(rule_based: Dict[str, Any], vlm_based: Dict[str, Any]) -> Dict[str, Any]:
+
+def merge_results(rule_results: Dict[str, Any], 
+                 vlm_result: ExtractionResult,
+                 vlm_confidence: float = 0.8) -> Dict[str, Any]:
     """
-    Merge rule-based and VLM results
+    Intelligently merge rule-based and VLM results
     
     Args:
-        rule_based: Rule-based extraction results
-        vlm_based: VLM extraction results
+        rule_results: Rule-based extraction
+        vlm_result: VLM extraction result
+        vlm_confidence: Base confidence for VLM results
         
     Returns:
-        Merged results
+        Merged results dictionary
     """
-    merged = rule_based.copy()
+    merged = rule_results.copy()
+    vlm_dict = vlm_result.to_dict()
     
-    # Merge each field
+    # Merge text/numeric fields
     for field in ['dealer_name', 'model_name', 'horse_power', 'asset_cost']:
-        rule_data = rule_based.get(field, {})
-        vlm_value = vlm_based.get(field)
+        rule_data = rule_results.get(field, {})
+        vlm_value = vlm_dict.get(field)
         
-        # If rule-based has no value but VLM does, use VLM
-        if rule_data.get('value') is None and vlm_value is not None:
+        rule_value = rule_data.get('value')
+        rule_conf = rule_data.get('confidence', 0)
+        
+        # VLM fills missing values
+        if rule_value is None and vlm_value is not None:
             merged[field] = {
                 'value': vlm_value,
-                'confidence': 0.8,  # VLM confidence
+                'confidence': vlm_confidence,
                 'source': 'vlm_fallback'
             }
-        
-        # If both have values, choose based on confidence
-        elif rule_data.get('value') is not None and vlm_value is not None:
-            rule_conf = rule_data.get('confidence', 0)
-            # If VLM provides same value, increase confidence
-            if str(rule_data['value']).lower() == str(vlm_value).lower():
-                merged[field]['confidence'] = min(rule_conf * 1.2, 0.95)
-                merged[field]['source'] = f"{rule_data.get('source', 'rule')}+vlm"
+        # Both have values - check agreement
+        elif rule_value and vlm_value:
+            # Normalize for comparison
+            rule_norm = str(rule_value).lower().replace(' ', '')
+            vlm_norm = str(vlm_value).lower().replace(' ', '')
+            
+            if rule_norm == vlm_norm or vlm_norm in rule_norm or rule_norm in vlm_norm:
+                # Agreement boosts confidence
+                merged[field]['confidence'] = min(rule_conf * 1.25, 0.95)
+                merged[field]['source'] = 'rule+vlm_confirmed'
+            else:
+                # Disagreement - prefer higher confidence
+                if vlm_confidence > rule_conf:
+                    merged[field] = {
+                        'value': vlm_value,
+                        'confidence': vlm_confidence,
+                        'source': 'vlm_override'
+                    }
     
-    # Merge signature/stamp info
-    if 'signature' in merged:
-        vlm_sig = vlm_based.get('signature_present')
-        if vlm_sig is not None:
-            merged['signature']['present'] = vlm_sig
-            merged['signature']['confidence'] = max(
-                merged['signature'].get('confidence', 0), 0.7
-            )
-    
-    if 'stamp' in merged:
-        vlm_stamp = vlm_based.get('stamp_present')
-        if vlm_stamp is not None:
-            merged['stamp']['present'] = vlm_stamp
-            merged['stamp']['confidence'] = max(
-                merged['stamp'].get('confidence', 0), 0.7
-            )
+    # Merge binary fields
+    for field, vlm_key in [('signature', 'signature_present'), ('stamp', 'stamp_present')]:
+        if field in merged and vlm_dict.get(vlm_key):
+            merged[field]['present'] = True
+            merged[field]['confidence'] = max(merged[field].get('confidence', 0), vlm_confidence)
     
     # Recalculate overall confidence
-    if 'overall_confidence' in merged:
-        # Simple average for now
-        field_confs = []
-        for field in ['dealer_name', 'model_name', 'horse_power', 'asset_cost']:
-            if field in merged:
-                field_confs.append(merged[field].get('confidence', 0))
-        
-        if field_confs:
-            merged['overall_confidence'] = sum(field_confs) / len(field_confs)
+    confidences = [
+        merged[f]['confidence'] for f in ['dealer_name', 'model_name', 'horse_power', 'asset_cost']
+        if f in merged and merged[f].get('value') is not None
+    ]
+    
+    if confidences:
+        merged['overall_confidence'] = sum(confidences) / len(confidences)
     
     return merged
 
+
 if __name__ == "__main__":
-    # Test VLM processor
-    print("Testing VLM Fallback Processor")
-    print("=" * 60)
+    print("Testing Efficient VLM Processor\n")
     
-    # Initialize processor
     vlm = get_vlm_processor()
     
     if not vlm.is_available():
-        print("VLM model not available. Trying to load smaller model...")
+        print("✗ VLM not available. Install: pip install transformers torch")
+        print("  Trying smaller model...")
         vlm = get_vlm_processor("Qwen/Qwen2.5-VL-2B-Instruct")
     
     if vlm.is_available():
-        print("✅ VLM processor initialized successfully")
+        print("✓ VLM initialized\n")
         
-        # Create a test image
-        from PIL import Image, ImageDraw, ImageFont
-        import numpy as np
-        
-        # Create a simple invoice image
-        img = Image.new('RGB', (800, 600), color='white')
+        # Create test image
+        img = Image.new('RGB', (800, 600), 'white')
+        from PIL import ImageDraw
         draw = ImageDraw.Draw(img)
         
-        # Add some text
-        draw.text((50, 50), "Invoice No: INV-2024-001", fill='black')
-        draw.text((50, 100), "Dealer: Mahindra Tractors Pvt Ltd", fill='black')
-        draw.text((50, 150), "Model: 575 DI", fill='black')
-        draw.text((50, 200), "Horse Power: 50 HP", fill='black')
-        draw.text((50, 250), "Total Cost: ₹5,25,000", fill='black')
+        texts = [
+            (50, 50, "INVOICE #2024-001"),
+            (50, 100, "Dealer: ABC Tractors Ltd"),
+            (50, 150, "Model: 575 DI"),
+            (50, 200, "HP: 50"),
+            (50, 250, "Cost: ₹5,25,000")
+        ]
         
-        print("\nTest Image Created")
-        print("Extracting with VLM...")
+        for x, y, text in texts:
+            draw.text((x, y), text, fill='black')
         
-        # Extract fields
-        ocr_text = "Invoice No: INV-2024-001 Dealer: Mahindra Tractors Pvt Ltd Model: 575 DI Horse Power: 50 HP Total Cost: ₹5,25,000"
-        results = vlm.extract_fields_vlm(img, ocr_text)
+        print("📄 Extracting from test image...")
+        ocr = "Dealer: ABC Tractors Ltd Model: 575 DI HP: 50 Cost: ₹525000"
         
-        print("\nVLM Extraction Results:")
-        print(json.dumps(results, indent=2, ensure_ascii=False))
+        import time
+        start = time.time()
+        result = vlm.extract_fields(img, ocr)
+        elapsed = time.time() - start
         
-        # Test fallback logic
-        print("\n" + "=" * 60)
-        print("Testing Fallback Logic")
-        print("=" * 60)
+        print(f"⏱️  Processed in {elapsed:.2f}s\n")
+        print("✓ Extracted:")
+        for k, v in result.to_dict().items():
+            print(f"  {k}: {v}")
         
-        # Simulate low confidence rule-based results
+        # Test merging
+        print("\n\n🔀 Testing result merging...")
         rule_results = {
             'dealer_name': {'value': None, 'confidence': 0.3},
-            'model_name': {'value': '575', 'confidence': 0.4},
-            'horse_power': {'value': None, 'confidence': 0.2},
-            'asset_cost': {'value': 525000, 'confidence': 0.9},
-            'overall_confidence': 0.45
+            'model_name': {'value': '575', 'confidence': 0.5},
+            'horse_power': {'value': 50, 'confidence': 0.9},
+            'asset_cost': {'value': 525000, 'confidence': 0.8},
+            'overall_confidence': 0.55
         }
         
         should_fallback = should_use_vlm_fallback(rule_results)
-        print(f"Should use VLM fallback: {should_fallback}")
+        print(f"Use VLM fallback: {should_fallback}")
         
         if should_fallback:
-            print("Using VLM as fallback...")
-            merged = merge_results(rule_results, results)
-            print("\nMerged Results:")
-            for field, data in merged.items():
-                if isinstance(data, dict) and 'value' in data:
-                    print(f"{field}: {data['value']} (conf: {data.get('confidence', 0):.2f})")
+            merged = merge_results(rule_results, result)
+            print("\n✓ Merged results:")
+            for field in ['dealer_name', 'model_name', 'horse_power', 'asset_cost']:
+                if field in merged:
+                    d = merged[field]
+                    print(f"  {field}: {d.get('value')} (conf: {d.get('confidence', 0):.2%}, src: {d.get('source', 'rule')})")
+            print(f"\n📊 Overall: {merged.get('overall_confidence', 0):.2%}")
         
     else:
-        print("❌ VLM processor not available")
-        print("Install transformers and torch to use this feature")
+        print("✗ VLM not available")
+    
+    print("\n✅ Tests completed!")

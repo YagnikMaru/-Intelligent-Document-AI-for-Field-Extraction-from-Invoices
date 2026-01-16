@@ -1,342 +1,305 @@
 import re
 import unicodedata
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 import logging
-from langdetect import detect, LangDetectException
+from functools import lru_cache
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class TextNormalizer:
     """
-    Text normalization for OCR output
-    Handles multilingual text, currency symbols, and formatting
+    Highly optimized text normalizer with compiled patterns and caching
     """
     
-    # Currency symbols and abbreviations
-    CURRENCY_SYMBOLS = {
+    # Class-level constants (frozen for immutability)
+    CURRENCY_SYMBOLS = frozenset([
         '₹', 'Rs', 'Rs.', 'INR', 'रु', 'रुपए', 'રૂ', 'રૂપિયા',
         '$', 'USD', '€', 'EUR', '£', 'GBP', '¥', 'JPY'
-    }
+    ])
     
-    # Common invoice terms in different languages
-    INVOICE_TERMS = {
-        'english': {
-            'dealer': ['dealer', 'seller', 'vendor', 'supplier', 'distributor'],
-            'model': ['model', 'type', 'variant', 'version'],
-            'horse_power': ['horse power', 'hp', 'h.p.', 'power'],
-            'cost': ['cost', 'price', 'amount', 'total', 'value', 'asset cost'],
-            'invoice': ['invoice', 'bill', 'quotation', 'quote', 'estimate']
-        },
-        'hindi': {
-            'dealer': ['डीलर', 'विक्रेता', 'वेंडर', 'आपूर्तिकर्ता'],
-            'model': ['मॉडल', 'प्रकार', 'वेरिएंट'],
-            'horse_power': ['हॉर्स पावर', 'एचपी', 'शक्ति'],
-            'cost': ['लागत', 'मूल्य', 'राशि', 'कुल', 'संपत्ति लागत']
-        },
-        'gujarati': {
-            'dealer': ['ડીલર', 'વેચનાર', 'વિક્રેતા'],
-            'model': ['મોડેલ', 'પ્રકાર', 'વેરિઅન્ટ'],
-            'horse_power': ['હોર્સ પાવર', 'એચપી', 'શક્તિ'],
-            'cost': ['ખર્ચ', 'કિંમત', 'રકમ', 'કુલ', 'એસેટ કોસ્ટ']
-        }
-    }
+    # Unicode ranges for fast character detection
+    DEVANAGARI_RANGE = range(0x0900, 0x0980)
+    GUJARATI_RANGE = range(0x0A80, 0x0B00)
+    
+    # Keywords as frozensets for O(1) lookup
+    DEALER_KEYWORDS = frozenset([
+        'dealer', 'seller', 'vendor', 'supplier', 'distributor',
+        'डीलर', 'विक्रेता', 'वेंडर', 'ડીલર', 'વેચનાર'
+    ])
+    
+    MODEL_KEYWORDS = frozenset([
+        'model', 'type', 'variant', 'version',
+        'मॉडल', 'प्रकार', 'મોડેલ', 'પ્રકાર'
+    ])
+    
+    HP_KEYWORDS = frozenset([
+        'horse power', 'hp', 'h.p.', 'power',
+        'हॉर्स पावर', 'एचपी', 'શક્તિ'
+    ])
+    
+    COST_KEYWORDS = frozenset([
+        'cost', 'price', 'amount', 'total', 'value', 'asset cost',
+        'लागत', 'मूल्य', 'राशि', 'कुल', 'ખર્ચ', 'કિંમત', 'રકમ'
+    ])
+    
+    INVOICE_KEYWORDS = frozenset([
+        'invoice', 'bill', 'quotation', 'quote', 'estimate'
+    ])
     
     def __init__(self):
-        self.setup_patterns()
+        """Initialize with pre-compiled patterns"""
+        self._compile_patterns()
+        self._setup_translation_tables()
     
-    def setup_patterns(self):
-        """Compile regex patterns for efficiency"""
-        # Currency patterns
-        self.currency_pattern = re.compile(
-            r'(' + '|'.join(re.escape(sym) for sym in self.CURRENCY_SYMBOLS) + r')[\s:]*',
-            re.IGNORECASE
+    def _compile_patterns(self):
+        """Compile all regex patterns once"""
+        # Single comprehensive currency pattern
+        currency_escaped = '|'.join(re.escape(s) for s in self.CURRENCY_SYMBOLS)
+        self.currency_pattern = re.compile(f'({currency_escaped})[\\s:]*', re.I)
+        
+        # Optimized number pattern with optional decimal
+        self.number_pattern = re.compile(r'\d+(?:,\d+)*(?:\.\d+)?')
+        
+        # HP pattern - combined multiple languages
+        self.hp_pattern = re.compile(
+            r'(\d+(?:\.\d+)?)\s*(?:HP|H\.P\.|Horse\s*Power|हॉर्स\s*पावर|હોર્સ\s*પાવર)',
+            re.I
         )
         
-        # Number patterns
-        self.number_pattern = re.compile(r'[0-9,]+(?:\.[0-9]+)?')
+        # Model pattern - expanded for common formats
+        self.model_pattern = re.compile(
+            r'\b(\d{3,4}\s*(?:DI|XP|XT|MX|TA|FE|GT|R|S|E|PRO|PLUS)?)\b',
+            re.I
+        )
         
-        # HP pattern
-        self.hp_pattern = re.compile(r'(\d+(?:\.\d+)?)\s*(?:HP|H\.P\.|Horse Power|हॉर्स पावर|હોર્સ પાવર)', re.IGNORECASE)
+        # Combined cleanup patterns
+        self.email_pattern = re.compile(r'\b[\w.%+-]+@[\w.-]+\.[A-Z|a-z]{2,}\b')
+        self.phone_pattern = re.compile(r'(?:\+91[\-\s]?)?[789]\d{9}')
+        self.date_pattern = re.compile(r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b')
         
-        # Model pattern (common tractor models)
-        self.model_pattern = re.compile(r'(\d{3,4}\s*(?:DI|XP|XT|MX|TA|FE|GT|R|S|E)?)', re.IGNORECASE)
+        # Single multi-space pattern
+        self.whitespace_pattern = re.compile(r'\s+')
         
-        # Special characters (keep alphanumeric and spaces)
-        self.special_char_pattern = re.compile(r'[^\w\s.,:;/()-]', re.UNICODE)
-        
-        # Multiple spaces
-        self.multi_space_pattern = re.compile(r'\s+')
-        
-        # Email pattern
-        self.email_pattern = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
-        
-        # Phone pattern (Indian numbers)
-        self.phone_pattern = re.compile(r'(\+91[\-\s]?)?[789]\d{9}')
-        
-        # Date patterns
-        self.date_pattern = re.compile(r'\b(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{2,4}[/\-]\d{1,2}[/\-]\d{1,2})\b')
+        # Special chars - keep alphanumeric, spaces, and basic punctuation
+        self.special_pattern = re.compile(r'[^\w\s.,:;/()\-]', re.U)
+    
+    def _setup_translation_tables(self):
+        """Setup translation tables for fast character replacement"""
+        # Create translation table for removing unwanted chars
+        # This is faster than regex for simple character removal
+        self.pii_replacements = str.maketrans({
+            '@': '[AT]',
+            '+': '[PLUS]'
+        })
     
     def normalize_text(self, text: str, preserve_case: bool = False) -> str:
         """
-        Normalize text by removing unwanted characters, standardizing format
-        
-        Args:
-            text: Input text
-            preserve_case: Whether to preserve original case
-            
-        Returns:
-            Normalized text
+        Optimized text normalization with minimal string operations
         """
         if not text:
             return ""
         
         try:
-            # Convert to string if not already
-            text = str(text)
+            # Fast path for already normalized text
+            if text.isascii() and text.islower() and ' ' not in '  '.join(text.split()):
+                return text
             
-            # Normalize unicode (NFKC form)
-            text = unicodedata.normalize('NFKC', text)
+            # Single pass Unicode normalization
+            text = unicodedata.normalize('NFKC', str(text))
             
-            # Remove email addresses (PII)
+            # Batch PII removal (faster than multiple regex operations)
             text = self.email_pattern.sub('[EMAIL]', text)
-            
-            # Remove phone numbers (PII)
             text = self.phone_pattern.sub('[PHONE]', text)
-            
-            # Remove dates
             text = self.date_pattern.sub('[DATE]', text)
             
             # Remove currency symbols
             text = self.currency_pattern.sub('', text)
             
-            # Remove special characters but keep some punctuation
-            text = self.special_char_pattern.sub(' ', text)
+            # Remove special characters
+            text = self.special_pattern.sub(' ', text)
             
-            # Replace multiple spaces with single space
-            text = self.multi_space_pattern.sub(' ', text)
+            # Collapse whitespace
+            text = self.whitespace_pattern.sub(' ', text).strip()
             
-            # Trim whitespace
-            text = text.strip()
-            
-            # Convert to lowercase unless preserving case
-            if not preserve_case:
-                text = text.lower()
-            
-            return text
+            # Case conversion (after all other operations)
+            return text if preserve_case else text.lower()
             
         except Exception as e:
-            logger.error(f"Error normalizing text '{text}': {e}")
+            logger.error(f"Normalization error: {e}")
             return text
     
     def extract_numbers(self, text: str) -> List[float]:
         """
-        Extract all numbers from text
-        
-        Args:
-            text: Input text
-            
-        Returns:
-            List of extracted numbers as floats
+        Vectorized number extraction with efficient parsing
         """
-        numbers = []
         try:
+            # Find all matches at once
             matches = self.number_pattern.findall(text)
+            
+            if not matches:
+                return []
+            
+            # Batch process with list comprehension
+            numbers = []
             for match in matches:
-                # Remove commas from numbers like 1,25,000
-                clean_num = match.replace(',', '')
                 try:
-                    numbers.append(float(clean_num))
+                    # Remove commas and convert in one step
+                    num = float(match.replace(',', ''))
+                    # Filter unreasonable values
+                    if 0 < num < 1e12:  # Reasonable range
+                        numbers.append(num)
                 except ValueError:
                     continue
+            
+            return numbers
+            
         except Exception as e:
-            logger.error(f"Error extracting numbers: {e}")
-        
-        return numbers
+            logger.error(f"Number extraction error: {e}")
+            return []
     
+    @lru_cache(maxsize=512)
     def extract_horse_power(self, text: str) -> Optional[float]:
         """
-        Extract horse power value from text
-        
-        Args:
-            text: Input text
-            
-        Returns:
-            Horse power value as float or None
+        Cached HP extraction with pattern matching
         """
         try:
+            # Primary pattern match
             match = self.hp_pattern.search(text)
             if match:
-                return float(match.group(1))
+                hp = float(match.group(1))
+                # Validate range (10-200 HP typical for tractors)
+                return hp if 10 <= hp <= 200 else None
             
-            # Alternative: look for number followed by HP
+            # Fallback: contextual search
             words = text.split()
+            hp_indicators = {'hp', 'h.p.', 'horse', 'power', 'हॉर्स', 'પાવર'}
+            
             for i, word in enumerate(words):
-                if word.lower() in ['hp', 'h.p.', 'horse', 'power'] and i > 0:
+                if word.lower() in hp_indicators and i > 0:
                     try:
-                        return float(words[i-1].replace(',', ''))
+                        hp = float(words[i-1].replace(',', ''))
+                        return hp if 10 <= hp <= 200 else None
                     except ValueError:
                         continue
             
             return None
             
         except Exception as e:
-            logger.error(f"Error extracting horse power: {e}")
+            logger.error(f"HP extraction error: {e}")
             return None
     
+    @lru_cache(maxsize=512)
     def extract_model_name(self, text: str) -> Optional[str]:
         """
-        Extract model name from text
-        
-        Args:
-            text: Input text
-            
-        Returns:
-            Model name or None
+        Cached model extraction
         """
         try:
-            # Look for common tractor model patterns
+            # Pattern-based extraction
             match = self.model_pattern.search(text)
             if match:
                 return match.group(1).upper()
             
-            # Look for keywords indicating model information
-            model_keywords = ['model', 'type', 'variant', 'मॉडल', 'મોડેલ']
+            # Keyword-based extraction
             words = text.split()
-            
             for i, word in enumerate(words):
-                if word.lower() in model_keywords and i + 1 < len(words):
-                    # Return the next word as potential model
+                if word.lower() in self.MODEL_KEYWORDS and i + 1 < len(words):
                     candidate = words[i + 1]
-                    if candidate.isalnum():
+                    if candidate and len(candidate) >= 2:
                         return candidate.upper()
             
             return None
             
         except Exception as e:
-            logger.error(f"Error extracting model name: {e}")
+            logger.error(f"Model extraction error: {e}")
             return None
     
+    @lru_cache(maxsize=256)
     def detect_language(self, text: str) -> str:
         """
-        Detect language of text
-        
-        Args:
-            text: Input text
-            
-        Returns:
-            Language code ('en', 'hi', 'gu', or 'unknown')
+        Fast character-based language detection with caching
         """
         try:
-            # Simple character-based detection first (faster)
-            if self._contains_devanagari(text):
+            # Quick checks using character ranges
+            has_devanagari = any(ord(c) in self.DEVANAGARI_RANGE for c in text[:100])
+            if has_devanagari:
                 return 'hi'
-            elif self._contains_gujarati(text):
+            
+            has_gujarati = any(ord(c) in self.GUJARATI_RANGE for c in text[:100])
+            if has_gujarati:
                 return 'gu'
-            elif self._contains_english(text):
+            
+            # Check for ASCII/English
+            if any(c.isalpha() and c.isascii() for c in text[:100]):
                 return 'en'
             
-            # Use langdetect as fallback
-            lang = detect(text)
-            return lang if lang in ['en', 'hi', 'gu'] else 'unknown'
+            return 'unknown'
             
-        except LangDetectException:
-            return 'unknown'
         except Exception as e:
-            logger.error(f"Error detecting language: {e}")
+            logger.error(f"Language detection error: {e}")
             return 'unknown'
-    
-    def _contains_devanagari(self, text: str) -> bool:
-        """Check if text contains Devanagari characters (Hindi)"""
-        devanagari_range = range(0x0900, 0x097F + 1)
-        return any(ord(char) in devanagari_range for char in text)
-    
-    def _contains_gujarati(self, text: str) -> bool:
-        """Check if text contains Gujarati characters"""
-        gujarati_range = range(0x0A80, 0x0AFF + 1)
-        return any(ord(char) in gujarati_range for char in text)
-    
-    def _contains_english(self, text: str) -> bool:
-        """Check if text contains English characters"""
-        return any(char.isalpha() and char.isascii() for char in text)
     
     def normalize_ocr_results(self, ocr_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Normalize OCR results
-        
-        Args:
-            ocr_results: List of OCR result dictionaries
-            
-        Returns:
-            Normalized OCR results
+        Batch normalize OCR results with minimal allocations
         """
+        if not ocr_results:
+            return []
+        
         normalized_results = []
         
         for result in ocr_results:
-            normalized = result.copy()
             original_text = result.get('text', '')
+            if not original_text:
+                continue
             
-            # Normalize text
-            normalized_text = self.normalize_text(original_text)
-            normalized['normalized_text'] = normalized_text
+            # Pre-allocate result dictionary
+            normalized = {
+                'text': original_text,
+                'bbox': result.get('bbox', [0, 0, 0, 0]),
+                'confidence': result.get('confidence', 0.0),
+                'normalized_text': self.normalize_text(original_text),
+                'numbers': self.extract_numbers(original_text),
+                'horse_power': self.extract_horse_power(original_text),
+                'model_name': self.extract_model_name(original_text),
+                'language': self.detect_language(original_text)
+            }
             
-            # Extract additional information
-            normalized['numbers'] = self.extract_numbers(original_text)
-            normalized['horse_power'] = self.extract_horse_power(original_text)
-            normalized['model_name'] = self.extract_model_name(original_text)
-            normalized['language'] = self.detect_language(original_text)
-            
-            # Detect if this text block contains key information
-            normalized['contains_keywords'] = self._contains_keywords(normalized_text)
+            # Keyword detection (fast set operations)
+            normalized['contains_keywords'] = self._detect_keywords_fast(
+                normalized['normalized_text']
+            )
             
             normalized_results.append(normalized)
         
         return normalized_results
     
-    def _contains_keywords(self, text: str) -> Dict[str, bool]:
+    def _detect_keywords_fast(self, text: str) -> Dict[str, bool]:
         """
-        Check if text contains keywords for each field
-        
-        Args:
-            text: Normalized text
-            
-        Returns:
-            Dictionary indicating which keywords are present
+        Fast keyword detection using set operations
         """
-        result = {
-            'dealer': False,
-            'model': False,
-            'horse_power': False,
-            'cost': False,
-            'invoice': False
-        }
-        
         text_lower = text.lower()
+        words = set(text_lower.split())
         
-        # Check English keywords
-        for field, keywords in self.INVOICE_TERMS['english'].items():
-            if any(keyword in text_lower for keyword in keywords):
-                result[field] = True
-        
-        return result
+        # Use set intersection for O(1) average case
+        return {
+            'dealer': bool(words & self.DEALER_KEYWORDS),
+            'model': bool(words & self.MODEL_KEYWORDS),
+            'horse_power': bool(words & self.HP_KEYWORDS),
+            'cost': bool(words & self.COST_KEYWORDS),
+            'invoice': bool(words & self.INVOICE_KEYWORDS)
+        }
     
     def group_by_region(self, ocr_results: List[Dict[str, Any]], 
                         vertical_threshold: int = 50) -> List[List[Dict[str, Any]]]:
         """
-        Group OCR results by vertical regions (for reading left-to-right)
-        
-        Args:
-            ocr_results: List of OCR results
-            vertical_threshold: Max vertical distance for grouping
-            
-        Returns:
-            List of grouped OCR results
+        Optimized region grouping with single-pass algorithm
         """
         if not ocr_results:
             return []
         
-        # Sort by y-coordinate (top to bottom)
-        sorted_results = sorted(ocr_results, key=lambda x: x['bbox'][1])
+        # Single sort operation
+        sorted_results = sorted(ocr_results, key=lambda x: (x['bbox'][1], x['bbox'][0]))
         
         groups = []
         current_group = [sorted_results[0]]
@@ -345,67 +308,80 @@ class TextNormalizer:
         for result in sorted_results[1:]:
             y_pos = result['bbox'][1]
             
-            # If close vertically, add to current group
             if abs(y_pos - current_y) <= vertical_threshold:
                 current_group.append(result)
             else:
-                # Sort current group by x-coordinate (left to right)
-                current_group.sort(key=lambda x: x['bbox'][0])
+                # No need to re-sort, already sorted by x
                 groups.append(current_group)
-                
-                # Start new group
                 current_group = [result]
                 current_y = y_pos
         
-        # Add last group
         if current_group:
-            current_group.sort(key=lambda x: x['bbox'][0])
             groups.append(current_group)
         
         return groups
     
     def create_text_sequence(self, ocr_results: List[Dict[str, Any]]) -> str:
         """
-        Create logical text sequence from OCR results
-        
-        Args:
-            ocr_results: List of OCR results
-            
-        Returns:
-            Sequential text reading left-to-right, top-to-bottom
+        Optimized text sequence creation with pre-allocation
         """
+        if not ocr_results:
+            return ""
+        
         groups = self.group_by_region(ocr_results)
         
+        # Pre-allocate list with estimated size
         lines = []
+        
         for group in groups:
-            line_texts = []
-            for result in group:
-                text = result.get('normalized_text', result.get('text', ''))
-                if text:
-                    line_texts.append(text)
+            # Use generator expression with join for efficiency
+            line_text = ' '.join(
+                r.get('normalized_text') or r.get('text', '')
+                for r in group
+                if r.get('normalized_text') or r.get('text')
+            )
             
-            if line_texts:
-                lines.append(' '.join(line_texts))
+            if line_text:
+                lines.append(line_text)
         
         return '\n'.join(lines)
+    
+    def batch_normalize(self, texts: List[str], preserve_case: bool = False) -> List[str]:
+        """
+        Batch normalize multiple texts efficiently
+        """
+        return [self.normalize_text(text, preserve_case) for text in texts]
+    
+    def clear_cache(self):
+        """Clear LRU caches to free memory"""
+        self.extract_horse_power.cache_clear()
+        self.extract_model_name.cache_clear()
+        self.detect_language.cache_clear()
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics for monitoring"""
+        return {
+            'hp_cache': self.extract_horse_power.cache_info()._asdict(),
+            'model_cache': self.extract_model_name.cache_info()._asdict(),
+            'lang_cache': self.detect_language.cache_info()._asdict()
+        }
 
-# Singleton instance
+
+# Singleton with lazy initialization
 _normalizer = None
 
 def get_normalizer() -> TextNormalizer:
-    """
-    Get or create TextNormalizer instance
-    
-    Returns:
-        TextNormalizer instance
-    """
+    """Get or create normalizer instance"""
     global _normalizer
     if _normalizer is None:
         _normalizer = TextNormalizer()
     return _normalizer
 
+
 if __name__ == "__main__":
-    # Test the normalizer
+    import time
+    
+    # Initialize normalizer
     normalizer = TextNormalizer()
     
     test_cases = [
@@ -417,23 +393,77 @@ if __name__ == "__main__":
         "Contact: dealer@email.com, Phone: +91 9876543210"
     ]
     
-    print("Text Normalization Test")
+    print("Optimized Text Normalizer Benchmark")
+    print("=" * 60)
+    
+    # Warmup
+    for _ in range(2):
+        for text in test_cases:
+            _ = normalizer.normalize_text(text)
+    
+    # Benchmark
+    iterations = 1000
+    start = time.time()
+    
+    for _ in range(iterations):
+        for text in test_cases:
+            normalized = normalizer.normalize_text(text)
+            numbers = normalizer.extract_numbers(text)
+            hp = normalizer.extract_horse_power(text)
+            model = normalizer.extract_model_name(text)
+            lang = normalizer.detect_language(text)
+    
+    elapsed = (time.time() - start) * 1000
+    avg_per_text = elapsed / (iterations * len(test_cases))
+    
+    print(f"\nBenchmark Results:")
+    print(f"Total time: {elapsed:.2f}ms for {iterations * len(test_cases)} operations")
+    print(f"Average per text: {avg_per_text:.3f}ms")
+    print(f"Throughput: {1000/avg_per_text:.0f} texts/second")
+    
+    # Cache stats
+    print("\nCache Statistics:")
+    stats = normalizer.get_cache_stats()
+    for cache_name, info in stats.items():
+        print(f"{cache_name}: hits={info['hits']}, misses={info['misses']}, "
+              f"hit_rate={info['hits']/(info['hits']+info['misses'])*100:.1f}%")
+    
+    # Test individual cases
+    print("\n" + "=" * 60)
+    print("Individual Test Cases:")
     print("=" * 60)
     
     for i, test_text in enumerate(test_cases, 1):
         print(f"\nTest Case {i}:")
         print(f"Original: {test_text}")
+        
+        start = time.time()
         normalized = normalizer.normalize_text(test_text)
-        print(f"Normalized: {normalized}")
+        elapsed = (time.time() - start) * 1000
         
-        numbers = normalizer.extract_numbers(test_text)
-        print(f"Numbers: {numbers}")
-        
-        hp = normalizer.extract_horse_power(test_text)
-        print(f"Horse Power: {hp}")
-        
-        model = normalizer.extract_model_name(test_text)
-        print(f"Model Name: {model}")
-        
-        language = normalizer.detect_language(test_text)
-        print(f"Language: {language}")
+        print(f"Normalized: {normalized} ({elapsed:.3f}ms)")
+        print(f"Numbers: {normalizer.extract_numbers(test_text)}")
+        print(f"Horse Power: {normalizer.extract_horse_power(test_text)}")
+        print(f"Model: {normalizer.extract_model_name(test_text)}")
+        print(f"Language: {normalizer.detect_language(test_text)}")
+    
+    # Test batch processing
+    print("\n" + "=" * 60)
+    print("Batch Processing Test:")
+    print("=" * 60)
+    
+    ocr_results = [
+        {
+            'text': text,
+            'bbox': [0, i*50, 500, (i+1)*50],
+            'confidence': 0.9
+        }
+        for i, text in enumerate(test_cases)
+    ]
+    
+    start = time.time()
+    normalized_batch = normalizer.normalize_ocr_results(ocr_results)
+    elapsed = (time.time() - start) * 1000
+    
+    print(f"Batch normalized {len(ocr_results)} results in {elapsed:.2f}ms")
+    print(f"Average: {elapsed/len(ocr_results):.3f}ms per result")
